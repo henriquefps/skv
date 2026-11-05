@@ -88,7 +88,7 @@ test('set-file stores bytes; get prints them back', () => {
   assert.equal(ls[0].type, 'file');
   assert.equal(ls[0].filename, 'upload.jks');
   const r = spawnSync(process.execPath, [BIN, 'get', 'openlive', 'UPLOAD_JKS'], {
-    env: { ...process.env, SKV_HOME: home, SKV_KEY: '' },
+    env: { ...process.env, SKV_HOME: home, SKV_KEY: '', SKV_ACTOR: 'user' },
   });
   assert.deepEqual([...r.stdout], [...bytes]);
 });
@@ -186,7 +186,7 @@ test('audit log records actions, actor and fingerprints, never values', () => {
   const home = initHome();
   const agentFree = Object.fromEntries(Object.keys(process.env).filter((k) => k === 'CLAUDECODE' || /^CODEX_/.test(k)).map((k) => [k, undefined]));
   ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { ...agentFree, SKV_ACTOR: '', ORCA_TERMINAL_ID: 'x' } }));
-  ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { CLAUDECODE: '1' } }));
+  ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { CLAUDECODE: '1', SKV_ACTOR: '' } }));
   ok(skv(home, ['get', 'g', 'K']));
   ok(skv(home, ['run', 'g', '--', process.execPath, '-e', '0']));
   ok(skv(home, ['export', 'g']));

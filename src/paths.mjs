@@ -13,6 +13,7 @@ export function layout(home) {
     config: path.join(home, 'config.json'),
     vault: path.join(home, 'vault'),
     log: path.join(home, 'log.jsonl'),
+    session: path.join(home, 'session.json'),
   };
 }
 

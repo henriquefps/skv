@@ -7,11 +7,15 @@ import { formatDotenv, parseDotenv } from '../src/dotenv.mjs';
 import { SkvError, usage } from '../src/errors.mjs';
 import { writeFileAtomic } from '../src/fsutil.mjs';
 import { assertSafeExportPath } from '../src/git.mjs';
-import { doctor, initHome, openVault } from '../src/home.mjs';
+import { doctor, initHome, keyStatus, openVault } from '../src/home.mjs';
+import { readKeyFile, writeKeyFile } from '../src/keys.mjs';
+import { assertPassphrase, unwrapKey, wrapKey } from '../src/passphrase.mjs';
+import { DEFAULT_UNLOCK, parseDuration, startSession, stopSession } from '../src/session.mjs';
+import { agentReadDenied, agentReadPolicy, readSettings, SETTINGS, settingFor, writeSetting } from '../src/settings.mjs';
 import { linkedGroups, listLinks, normalizeDir, removeLink, setLink } from '../src/links.mjs';
-import { appendLog, parseSince, readLog } from '../src/log.mjs';
+import { appendLog, detectActor, parseSince, readLog } from '../src/log.mjs';
 import { skvHome } from '../src/paths.mjs';
-import { readSecretValue } from '../src/prompt.mjs';
+import { readPassphrases, readSecretValue } from '../src/prompt.mjs';
 import { materialize, runChild } from '../src/run.mjs';
 import { assertGroup, assertKey, isKeyName, parseGroupList } from '../src/vault.mjs';
 
@@ -23,6 +27,7 @@ const USAGE = `skv: secrets keeper vault (local, encrypted)
   skv set <group> <KEY> [--note t] [--desc t]   value from stdin (pipe) or a hidden prompt, never argv
   skv set-file <group> <KEY> <path> [--note t]  store a file (binary or text)
   skv get <group> <KEY>                      print one value (logged); file secrets print the file bytes
+                                             (refused for agents unless agent-read is allow)
   skv rm <group> <KEY> | skv rm <group> --all   [--yes]
   skv import <group> <file.env>              import a dotenv file (added / changed / unchanged)
   skv rollback <group> <KEY> [--yes]         restore the previous value (run again to undo)
@@ -35,12 +40,19 @@ const USAGE = `skv: secrets keeper vault (local, encrypted)
   skv links [--json]                         list linked folders
   skv which [--path dir] [--json]            groups that apply to a folder (its link or the nearest linked parent)
   skv log [group] [--since 7d] [--json]      audit log (never values)
-  skv doctor [--json]                        permissions, key, files decrypt, orphan links
+  skv doctor [--json]                        permissions, key, files decrypt, orphan links, passphrase, session
+  skv config [--json] | skv config set agent-read allow|deny
+                                             settings (agent-read: may agents print values; default deny)
+  skv passphrase set|change|remove           protect the key file with a passphrase (opt-in; stdin for scripts)
+  skv unlock [--for 8h]                      start a background session that holds the key (30m, 12h, 1d...)
+  skv lock                                   end the session
+  skv status [--json]                        locked / unlocked / no passphrase, expiry, key source
 
 Exit codes: 0 ok, 1 error, 2 usage (run forwards the command's exit code; 127 if it can't be started).
-Env: SKV_HOME (vault folder), SKV_KEY (base64 master key, overrides $SKV_HOME/key).`;
+Env: SKV_HOME (vault folder), SKV_KEY (base64 master key, overrides the session and $SKV_HOME/key),
+     SKV_ACTOR=user|agent (override agent detection).`;
 
-const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since', 'path']);
+const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since', 'path', 'for']);
 const SHORT = { o: 'output', y: 'yes', h: 'help' };
 
 export function parseArgs(argv) {
@@ -138,7 +150,7 @@ async function main(argv) {
     }
 
     case 'groups': {
-      const groups = openVault(home).groups();
+      const groups = (await openVault(home)).groups();
       if (flags.json) return json(groups);
       if (!groups.length) return console.log('no groups yet (skv set <group> <KEY>)');
       return console.log(table(['GROUP', 'SECRETS', 'UPDATED', 'DESCRIPTION'], groups.map((g) => [g.group, g.count, ago(g.updatedAt), g.description])));
@@ -146,7 +158,7 @@ async function main(argv) {
 
     case 'ls': {
       const group = pos[1] ? assertGroup(pos[1]) : undefined;
-      const items = openVault(home).list(group);
+      const items = (await openVault(home)).list(group);
       if (flags.json) return json(items);
       if (!items.length) return console.log(group ? `group "${group}" is empty` : 'no secrets yet');
       return console.log(
@@ -161,7 +173,7 @@ async function main(argv) {
       need(pos, 3, 'skv set <group> <KEY> [--note text]   (value from stdin or a hidden prompt)');
       if (pos.length > 3) throw usage('skv set takes no value argument: pipe it on stdin or type it at the prompt (argv lands in shell history)');
       const [group, key] = [assertGroup(pos[1]), assertKey(pos[2])];
-      const vault = openVault(home);
+      const vault = await openVault(home);
       const value = await readSecretValue(`${group}/${key}`);
       const [r] = vault.setSecrets(group, [{ key, value, note: str(flags.note) }], { description: str(flags.desc) });
       log({ action: 'set', group, key, changed: r.changed, fingerprint: r.fingerprint });
@@ -171,7 +183,7 @@ async function main(argv) {
     case 'set-file': {
       need(pos, 4, 'skv set-file <group> <KEY> <path> [--note text]');
       const [group, key, file] = [assertGroup(pos[1]), assertKey(pos[2]), pos[3]];
-      const vault = openVault(home);
+      const vault = await openVault(home);
       let bytes;
       try {
         bytes = fs.readFileSync(file);
@@ -189,7 +201,11 @@ async function main(argv) {
     case 'get': {
       need(pos, 3, 'skv get <group> <KEY>');
       const [group, key] = [assertGroup(pos[1]), assertKey(pos[2])];
-      const s = openVault(home).getSecret(group, key);
+      if (agentDenied(home)) {
+        log({ action: 'get', group, key, denied: true });
+        throw agentReadDenied('`skv get`');
+      }
+      const s = (await openVault(home)).getSecret(group, key);
       log({ action: 'get', group, key });
       if (s.type === 'file') return void process.stdout.write(Buffer.from(s.value, 'base64'));
       return void process.stdout.write(process.stdout.isTTY ? `${s.value}\n` : s.value);
@@ -198,7 +214,7 @@ async function main(argv) {
     case 'rm': {
       need(pos, 2, 'skv rm <group> <KEY> | skv rm <group> --all');
       const group = assertGroup(pos[1]);
-      const vault = openVault(home);
+      const vault = await openVault(home);
       if (flags.all) {
         if (pos[2]) throw usage('skv rm <group> --all takes no key');
         const n = Object.keys(vault.requireGroup(group).secrets).length;
@@ -220,7 +236,7 @@ async function main(argv) {
       need(pos, 3, 'skv rollback <group> <KEY> [--yes]');
       if (pos.length > 3) throw usage(`skv rollback: unexpected "${pos[3]}"`);
       const [group, key] = [assertGroup(pos[1]), assertKey(pos[2])];
-      const vault = openVault(home);
+      const vault = await openVault(home);
       const prev = vault.previousVersion(group, key);
       if (!prev) throw new SkvError('no-history', `${group}/${key} has no previous value to roll back to`);
       if (!(await confirm(`roll back ${group}/${key} to the value replaced at ${ago(prev.replacedAt)} (fingerprint ${prev.fingerprint})?`, flags))) {
@@ -243,7 +259,7 @@ async function main(argv) {
       if (pos.length > 2) throw usage(`skv link: unexpected "${pos[2]}" (separate groups with commas)`);
       const groups = parseGroupList(pos[1]);
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new SkvError('not-found', `${dir} is not a folder`);
-      const vault = openVault(home);
+      const vault = await openVault(home);
       const missing = groups.filter((g) => !vault.hasGroup(g));
       if (missing.length) throw new SkvError('not-found', `no group ${missing.map((g) => `"${g}"`).join(', ')} (see \`skv groups\`)`);
       const previous = setLink(home, dir, groups);
@@ -280,7 +296,7 @@ async function main(argv) {
       const entries = parseDotenv(text);
       const bad = entries.filter((e) => !isKeyName(e.key));
       if (bad.length) throw new SkvError('invalid', `invalid key name(s) (must match [A-Z_][A-Z0-9_]*): ${bad.map((e) => `${e.key} (line ${e.line})`).join(', ')}`);
-      const vault = openVault(home);
+      const vault = await openVault(home);
       const last = new Map(entries.map((e) => [e.key, e.value]));
       const results = vault.setSecrets(group, [...last].map(([key, value]) => ({ key, value })), { description: str(flags.desc) });
       for (const r of results) log({ action: 'import', group, key: r.key, changed: r.changed, fingerprint: r.fingerprint, source: path.basename(pos[2]) });
@@ -299,8 +315,12 @@ async function main(argv) {
       if (!['dotenv', 'json'].includes(format)) throw usage(`--format must be dotenv or json`);
       const out = flags.output === true ? null : flags.output;
       if (flags.output === true) throw usage('-o needs a file path');
+      if (!out && agentDenied(home)) {
+        log({ action: 'export', group: groups.join(','), groups, format, target: 'stdout', denied: true });
+        throw agentReadDenied('`skv export` to stdout', 'write a git-ignored file with `-o <file>`, or use `skv run <group> -- <cmd>`');
+      }
       if (out) assertSafeExportPath(out);
-      const secrets = openVault(home).collect(groups);
+      const secrets = (await openVault(home)).collect(groups);
       const strings = secrets.filter((s) => s.type !== 'file');
       for (const s of secrets) if (s.type === 'file') process.stderr.write(`skv: skipped file secret ${s.group}/${s.key} (use skv get or skv run)\n`);
       const body = format === 'json' ? `${JSON.stringify(Object.fromEntries(strings.map((s) => [s.key, s.value])), null, 2)}\n` : formatDotenv(strings);
@@ -315,7 +335,7 @@ async function main(argv) {
       if (!rest.length) throw usage('skv run: missing command after --');
       if (pos.length > 2) throw usage(`skv run: unexpected "${pos[2]}" before --`);
       const groups = groupsOrLinked(home, pos[1]);
-      const secrets = openVault(home).collect(groups);
+      const secrets = (await openVault(home)).collect(groups);
       log({ action: 'run', group: groups.join(','), groups, keys: secrets.map((s) => s.key), command: path.basename(rest[0]) });
       const { env, cleanup } = materialize(secrets);
       const r = await runChild(rest[0], rest.slice(1), env, cleanup);
@@ -351,7 +371,7 @@ async function main(argv) {
     }
 
     case 'doctor': {
-      const results = doctor(home);
+      const results = await doctor(home);
       const errors = results.filter((r) => r.level === 'error').length;
       if (errors) process.exitCode = 1;
       if (flags.json) return json({ ok: errors === 0, results });
@@ -360,10 +380,102 @@ async function main(argv) {
       return console.log(errors ? c.red(`\n${errors} error(s)`) : c.green('\nno errors'));
     }
 
+    case 'config': {
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      if (pos[1] === 'set') {
+        need(pos, 4, 'skv config set <setting> <value>   (agent-read allow|deny)');
+        const [name, value] = [pos[2], pos[3]];
+        settingFor(name);
+        if (detectActor() === 'agent') throw new SkvError('denied', `only the user can change ${name}: ask them to run \`skv config set ${name} ${value}\``);
+        const previous = writeSetting(home, name, value);
+        log({ action: 'config', setting: name, setTo: value, previous });
+        return console.log(`${name}: ${previous} -> ${value}`);
+      }
+      if (pos[1]) throw usage('usage: skv config [--json] | skv config set <setting> <value>');
+      const settings = readSettings(home);
+      if (flags.json) return json(settings);
+      return console.log(table(['SETTING', 'VALUE', 'MEANING'], Object.entries(settings).map(([k, v]) => [k, v, SETTINGS[k].describe])));
+    }
+
+    case 'passphrase': {
+      const sub = pos[1];
+      if (!['set', 'change', 'remove'].includes(sub) || pos.length > 2) throw usage('usage: skv passphrase set|change|remove');
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      const k = readKeyFile(home);
+      if (!k) throw new SkvError('no-key', `${path.join(home, 'key')} is missing: the passphrase protects the key file (run \`skv init\`)`);
+      if (sub === 'set') {
+        if (k.kind === 'wrapped') throw new SkvError('exists', 'a passphrase is already set: use `skv passphrase change` or `skv passphrase remove`');
+        const [pass] = await readPassphrases([{ label: 'new passphrase', confirm: true }]);
+        writeKeyFile(home, wrapKey(k.key, assertPassphrase(pass)));
+        k.key.fill(0);
+        log({ action: 'passphrase-set' });
+        console.log('the key file is now passphrase-protected (the vault itself is unchanged; an SKV_KEY backup still works)');
+        return console.log('run `skv unlock` to use the vault; forgetting the passphrase without a backup of the key loses the vault');
+      }
+      if (k.kind !== 'wrapped') throw new SkvError('no-passphrase', 'no passphrase is set (see `skv passphrase set`)');
+      if (sub === 'change') {
+        const [cur, next] = await readPassphrases([{ label: 'current passphrase' }, { label: 'new passphrase', confirm: true }]);
+        assertPassphrase(next);
+        const key = unwrapKey(k.envelope, cur);
+        writeKeyFile(home, wrapKey(key, next));
+        key.fill(0);
+        log({ action: 'passphrase-change' });
+        return console.log('passphrase changed (a running unlock session keeps working)');
+      }
+      const [cur] = await readPassphrases([{ label: 'current passphrase' }]);
+      const key = unwrapKey(k.envelope, cur);
+      writeKeyFile(home, key);
+      key.fill(0);
+      await stopSession(home);
+      log({ action: 'passphrase-remove' });
+      return console.log('passphrase removed: the key file holds the raw key again (mode 600)');
+    }
+
+    case 'unlock': {
+      if (pos.length > 1) throw usage('usage: skv unlock [--for 8h]');
+      if (flags.for === true) throw usage('--for needs a duration (30m, 8h, 1d)');
+      const ms = parseDuration(flags.for ?? DEFAULT_UNLOCK);
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      const k = readKeyFile(home);
+      if (!k) throw new SkvError('no-key', `${path.join(home, 'key')} is missing: run \`skv init\``);
+      if (k.kind !== 'wrapped') throw new SkvError('no-passphrase', 'no passphrase is set, so there is nothing to unlock (see `skv passphrase set`)');
+      const [pass] = await readPassphrases([{ label: 'passphrase' }]);
+      const key = unwrapKey(k.envelope, pass);
+      const r = await startSession(home, key, ms);
+      key.fill(0);
+      log({ action: 'unlock', expiresAt: r.expiresAt, pid: r.pid });
+      return console.log(`unlocked until ${ago(r.expiresAt)} (session pid ${r.pid}; \`skv lock\` ends it)`);
+    }
+
+    case 'lock': {
+      if (pos.length > 1) throw usage('usage: skv lock');
+      const r = await stopSession(home);
+      if (r.stopped) log({ action: 'lock' });
+      return console.log(r.stopped ? 'locked: the unlock session has ended' : r.stale ? 'no running session (removed stale session files)' : 'no unlock session was running');
+    }
+
+    case 'status': {
+      if (pos.length > 1) throw usage('usage: skv status [--json]');
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      const st = await keyStatus(home);
+      const state = !st.passphrase ? 'no passphrase' : st.session.state === 'active' ? 'unlocked' : 'locked';
+      if (flags.json) return json({ state, ...st, agentRead: agentReadPolicy(home) });
+      const source = { env: 'SKV_KEY environment variable', session: 'unlock session', file: 'key file', locked: 'none (locked)', none: 'none (no key)' }[st.source];
+      console.log(`home:        ${home}`);
+      console.log(`state:       ${state}`);
+      if (st.session.state === 'active') console.log(`expires:     ${ago(st.session.expiresAt)} (pid ${st.session.pid})`);
+      if (st.session.state === 'stale') console.log(`session:     ${c.yellow(`stale (${st.session.reason}); \`skv lock\` cleans up`)}`);
+      console.log(`key source:  ${source}`);
+      return console.log(`agent-read:  ${agentReadPolicy(home)}`);
+    }
+
     default:
       throw usage(`unknown command: ${cmd}\n\n${USAGE}`);
   }
 }
+
+/** True when the caller is an agent and config says agents may not print values. */
+const agentDenied = (home) => detectActor() === 'agent' && agentReadPolicy(home) !== 'allow';
 
 const str = (v) => (v === undefined ? undefined : v === true ? '' : String(v));
 
@@ -376,6 +488,9 @@ function detail(e) {
   if (e.all) parts.push(`whole group (${e.count})`);
   if (e.from) parts.push(`from fp ${e.from}`);
   if (e.path) parts.push(`${e.removed ? 'unlinked' : 'linked'} ${e.path}`);
+  if (e.denied) parts.push('DENIED (agent-read)');
+  if (e.setting) parts.push(`${e.setting}: ${e.previous} -> ${e.setTo}`);
+  if (e.action === 'unlock' && e.expiresAt) parts.push(`until ${e.expiresAt}`);
   return parts.join(', ');
 }
 
