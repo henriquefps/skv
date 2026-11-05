@@ -5,7 +5,7 @@ repository, with a CLI for people and coding agents and an audit log.
 
 - AES-256-GCM, one encrypted file per group, a single master key you guard.
 - `skv run <group> -- <cmd>` injects secrets as env vars, so values stay out of repos, `.env` files and agent
-  transcripts.
+  transcripts. Link groups to a project folder once and `skv run -- <cmd>` picks them up from anywhere inside it.
 - Values are never read from argv (shell history), never printed by listings, never written to the log.
 - macOS, Linux and Windows. Node 20+, zero npm dependencies, no OS keychain.
 
@@ -46,6 +46,14 @@ skv ls openai
 skv run openai -- node scripts/eval.mjs
 skv run openai,cloudflare -- npm run deploy
 
+# link groups to a project once, then skip the group name anywhere inside it
+skv link openai,cloudflare --path ~/code/myapp
+cd ~/code/myapp/scripts && skv run -- npm run deploy
+skv which                    # openai,cloudflare  (linked at /home/me/code/myapp)
+
+# undo a bad rotation
+skv rollback openai OPENAI_API_KEY
+
 # who used what
 skv log --since 7d
 ```
@@ -62,10 +70,19 @@ skv log --since 7d
 | `skv get <group> <KEY>` | Print one value (no trailing newline when piped; raw bytes for file secrets). Logged. |
 | `skv rm <group> <KEY>` / `skv rm <group> --all` | Delete one key or a whole group. Asks for confirmation; `--yes`/`-y` skips it (required without a TTY). |
 | `skv import <group> <file>` | Import a dotenv file: `# comments`, `export KEY=`, unquoted values with ` # inline comments`, `'single'` (literal), `"double"` (escapes `\n \r \t \\ \" \$`) and multiline quoted values. Reports added / changed / unchanged. `--json` for structured output. |
-| `skv export <group>[,group...] [--format dotenv\|json] [-o file]` | Write the secrets to stdout or to a file (mode 0600, atomic). Inside a git repo the path must be git-ignored (checked with `git check-ignore`), otherwise skv refuses. File secrets are skipped (use `run` or `get`). |
-| `skv run <group>[,group...] -- <cmd> [args...]` | Run a command with the secrets added to its environment. File secrets are written to a private temp folder (0700, files 0600) and the variable holds the path; the folder is removed when the command ends. Signals (Ctrl-C, SIGTERM, ...) are forwarded; the command's exit code is returned. |
+| `skv rollback <group> <KEY> [--yes]` | Restore the most recent previous value. The current value goes into the history, so a second rollback undoes the first. Asks for confirmation (`--yes`/`-y` without a TTY); an error when the key has no history. Logged with the old and new fingerprints. |
+| `skv export [group[,group...]] [--format dotenv\|json] [-o file]` | Write the secrets to stdout or to a file (mode 0600, atomic). Inside a git repo the path must be git-ignored (checked with `git check-ignore`), otherwise skv refuses. File secrets are skipped (use `run` or `get`). |
+| `skv run [group[,group...]] -- <cmd> [args...]` | Run a command with the secrets added to its environment. File secrets are written to a private temp folder (0700, files 0600) and the variable holds the path; the folder is removed when the command ends. Signals (Ctrl-C, SIGTERM, ...) are forwarded; the command's exit code is returned. |
+| `skv link <group>[,group...] [--path dir]` | Link groups to a project folder (default: the current folder), stored in `config.json`. Replaces the folder's previous groups. Every group must exist. |
+| `skv link --rm [--path dir]` | Remove a folder's link (works for folders that no longer exist). |
+| `skv links [--json]` | Linked folders and their groups; missing folders are marked. |
+| `skv which [--path dir] [--json]` | The groups that apply to a folder: its own link or the nearest linked parent folder. Exit 1 when none. |
 | `skv log [group] [--since 30m\|12h\|7d\|2w\|date] [--json]` | Audit log. |
-| `skv doctor [--json]` | Checks folder/file permissions, key present and valid, config, every group decrypts, leftover temp files. Exit 1 on errors. |
+| `skv doctor [--json]` | Checks folder/file permissions, key present and valid, config, every group decrypts, leftover temp and stale lock files, links whose folder or groups are gone (warnings). Exit 1 on errors. |
+
+`run` and `export` without a group use the groups linked to the current folder or its nearest linked parent, and fail
+with a clear error when there is none. Link paths are absolute and normalized (symlinks resolved); they are compared
+case-insensitively on Windows and macOS.
 
 The same key name in two groups passed to `run` or `export` is an error (which one should win is ambiguous).
 
@@ -84,16 +101,17 @@ Environment:
 ```
 ~/.skv/
   key            32 random bytes, base64: the master key
-  config.json    version and settings (no secrets)
+  config.json    version, settings and folder links (no secrets)
   vault/
     <group>.enc  one encrypted file per group
+    <group>.lock present only while a write to that group is in progress
   log.jsonl      audit log, one JSON object per line
 ```
 
 Each `.enc` file is `{ "v": 1, "alg": "aes-256-gcm", "iv", "tag", "data" }` (base64), a random 12-byte IV per write,
 and the group name as additional authenticated data, so a file renamed to another group fails to decrypt. Writes
-go to a temp file in the same folder and are renamed into place. Each key keeps its last 5 previous values
-(`rollback` comes in a later version).
+go to a temp file in the same folder and are renamed into place. Each key keeps its last 5 previous values,
+which `skv rollback` restores.
 
 Audit log lines: `{ ts, action, group, key, host, actor, user, cwd, ... }`. `actor` is `agent` when the process runs
 under a coding agent (`CLAUDECODE` or `CODEX_*` env vars), otherwise `user` (`ORCA_*` is ignored: Orca sets it in
@@ -124,8 +142,12 @@ What it does not protect against:
   but not if skv itself is killed with SIGKILL or the machine loses power (they stay in the OS temp folder, mode 0600).
 - **Windows permissions.** Modes 0700/0600 are best effort; Windows ignores them and the vault relies on the ACLs of
   your user profile folder. Keep `SKV_HOME` inside your profile.
-- **Concurrent writes.** Two `skv set` on the same group at the same moment never corrupt a file (writes are atomic)
-  but the last one wins.
+- **Concurrent writes.** Writes to a group (`set`, `set-file`, `import`, `rm`, `rollback`) hold a lock file
+  (`vault/<group>.lock`, created exclusively) around read-modify-write, so concurrent `skv set` on the same group
+  don't lose each other's keys; a writer waits up to 5 s for the lock. A lock left by a crashed process goes stale
+  after 30 s and is taken over (`skv doctor` reports it). The lock is advisory: it only coordinates skv processes,
+  and on network or synced folders exclusive creation may not be reliable. Setting the same key at the same moment
+  still means the last one wins (the other value is in its history).
 
 ## Development
 

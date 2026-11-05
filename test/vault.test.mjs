@@ -69,3 +69,33 @@ test('init is idempotent and refuses to create a new key over existing groups', 
   assert.throws(() => initHome(v.home, {}), { code: 'no-key' });
   assert.equal(fs.existsSync(path.join(v.home, 'key')), false);
 });
+
+test('rollback restores the previous value; a second rollback undoes it', () => {
+  const v = fresh();
+  v.setSecrets('g', [{ key: 'K', value: 'v1' }]);
+  assert.throws(() => v.rollback('g', 'K'), { code: 'no-history' });
+  v.setSecrets('g', [{ key: 'K', value: 'v2' }]);
+  v.setSecrets('g', [{ key: 'K', value: 'v3' }]);
+  const r = v.rollback('g', 'K');
+  assert.equal(r.fingerprint, v.fingerprint('v2'));
+  assert.equal(r.from, v.fingerprint('v3'));
+  assert.doesNotMatch(JSON.stringify(r), /v2|v3/);
+  assert.equal(v.getSecret('g', 'K').value, 'v2');
+  assert.deepEqual(v.getSecret('g', 'K').history.map((h) => h.value), ['v3', 'v1']);
+  v.rollback('g', 'K');
+  assert.equal(v.getSecret('g', 'K').value, 'v3');
+  assert.deepEqual(v.getSecret('g', 'K').history.map((h) => h.value), ['v2', 'v1']);
+  assert.throws(() => v.rollback('g', 'NOPE'), { code: 'not-found' });
+  assert.deepEqual(fs.readdirSync(path.join(v.home, 'vault')), ['g.enc'], 'lock file released');
+});
+
+test('rollback restores the type and file name of a file secret', () => {
+  const v = fresh();
+  v.setSecrets('g', [{ key: 'F', value: 'YQ==', type: 'file', filename: 'a.jks' }]);
+  v.setSecrets('g', [{ key: 'F', value: 'plain' }]);
+  assert.equal(v.getSecret('g', 'F').filename, undefined);
+  v.rollback('g', 'F');
+  const s = v.getSecret('g', 'F');
+  assert.deepEqual([s.type, s.filename, s.value], ['file', 'a.jks', 'YQ==']);
+  assert.deepEqual(s.history.map((h) => [h.type ?? 'string', h.value]), [['string', 'plain']]);
+});

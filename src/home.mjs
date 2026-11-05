@@ -3,10 +3,12 @@ import path from 'node:path';
 import { SkvError } from './errors.mjs';
 import { ensurePrivateDir, isTempFile, modeOf, writeFileAtomic } from './fsutil.mjs';
 import { fileKeyProvider, findKeyProvider, generateKey, loadKey } from './keys.mjs';
+import { CONFIG_VERSION, defaultConfig, listLinks } from './links.mjs';
+import { isLockFile, LOCK_STALE_MS } from './lock.mjs';
 import { isWindows, layout } from './paths.mjs';
 import { Vault } from './vault.mjs';
 
-export const CONFIG_VERSION = 1;
+export { CONFIG_VERSION };
 
 /**
  * Create the home folder, vault/, key and config.json. Idempotent: never replaces an existing key or config.
@@ -32,7 +34,7 @@ export function initHome(home, env = process.env) {
     keySource = 'file';
   }
   if (!fs.existsSync(p.config)) {
-    writeFileAtomic(p.config, `${JSON.stringify({ version: CONFIG_VERSION, settings: {}, links: {} }, null, 2)}\n`);
+    writeFileAtomic(p.config, `${JSON.stringify(defaultConfig(), null, 2)}\n`);
     created.push(p.config);
   }
   return { home, created, keySource };
@@ -80,10 +82,12 @@ export function doctor(home, env = process.env) {
   }
   checkMode(p.key, 0o600, 'key');
 
+  let configOk = false;
   if (!fs.existsSync(p.config)) add('warn', 'config', `${p.config} is missing (run \`skv init\`)`);
   else {
     try {
       const cfg = JSON.parse(fs.readFileSync(p.config, 'utf8'));
+      configOk = true;
       if (cfg.version !== CONFIG_VERSION) add('warn', 'config', `config version ${cfg.version}, expected ${CONFIG_VERSION}`);
       else add('ok', 'config', p.config);
     } catch {
@@ -92,12 +96,37 @@ export function doctor(home, env = process.env) {
     checkMode(p.config, 0o600, 'config');
   }
 
+  if (configOk) {
+    const links = listLinks(home);
+    let bad = 0;
+    for (const l of links) {
+      if (!l.exists) {
+        bad++;
+        add('warn', 'links', `${l.path} no longer exists (linked to ${l.groups.join(',')}; remove with \`skv link --rm --path "${l.path}"\`)`);
+      }
+      const missing = l.groups.filter((g) => !fs.existsSync(path.join(p.vault, `${g}.enc`)));
+      if (missing.length) {
+        bad++;
+        add('warn', 'links', `${l.path} is linked to missing group(s) ${missing.join(',')} (re-link with \`skv link\`)`);
+      }
+    }
+    if (!bad) add('ok', 'links', `${links.length} link(s)`);
+  }
+
   if (fs.existsSync(p.vault)) {
     const vault = key ? new Vault(home, key) : null;
     for (const f of fs.readdirSync(p.vault)) {
       const file = path.join(p.vault, f);
       if (isTempFile(f)) {
         add('warn', 'vault', `leftover temp file ${file} (an interrupted write; safe to delete)`);
+        continue;
+      }
+      if (isLockFile(f)) {
+        let age = 0;
+        try {
+          age = Date.now() - fs.statSync(file).mtimeMs;
+        } catch {}
+        if (age > LOCK_STALE_MS) add('warn', 'vault', `stale lock file ${file} (a crashed write; safe to delete when no skv is running)`);
         continue;
       }
       if (!f.endsWith('.enc')) continue;

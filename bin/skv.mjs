@@ -8,6 +8,7 @@ import { SkvError, usage } from '../src/errors.mjs';
 import { writeFileAtomic } from '../src/fsutil.mjs';
 import { assertSafeExportPath } from '../src/git.mjs';
 import { doctor, initHome, openVault } from '../src/home.mjs';
+import { linkedGroups, listLinks, normalizeDir, removeLink, setLink } from '../src/links.mjs';
 import { appendLog, parseSince, readLog } from '../src/log.mjs';
 import { skvHome } from '../src/paths.mjs';
 import { readSecretValue } from '../src/prompt.mjs';
@@ -24,16 +25,22 @@ const USAGE = `skv: secrets keeper vault (local, encrypted)
   skv get <group> <KEY>                      print one value (logged); file secrets print the file bytes
   skv rm <group> <KEY> | skv rm <group> --all   [--yes]
   skv import <group> <file.env>              import a dotenv file (added / changed / unchanged)
-  skv export <group>[,group...] [--format dotenv|json] [-o file]
+  skv rollback <group> <KEY> [--yes]         restore the previous value (run again to undo)
+  skv export [group[,group...]] [--format dotenv|json] [-o file]
                                              to a file (0600) or stdout; refuses non-ignored paths in a git repo
-  skv run <group>[,group...] -- <cmd> [args...]   run a command with the secrets as env vars
+  skv run [group[,group...]] -- <cmd> [args...]   run a command with the secrets as env vars
+                                             (no group: the groups linked to the current folder)
+  skv link <group>[,group...] [--path dir]   link groups to a project folder (default: current folder)
+  skv link --rm [--path dir]                 remove a folder's link
+  skv links [--json]                         list linked folders
+  skv which [--path dir] [--json]            groups that apply to a folder (its link or the nearest linked parent)
   skv log [group] [--since 7d] [--json]      audit log (never values)
-  skv doctor [--json]                        permissions, key, files decrypt
+  skv doctor [--json]                        permissions, key, files decrypt, orphan links
 
 Exit codes: 0 ok, 1 error, 2 usage (run forwards the command's exit code; 127 if it can't be started).
 Env: SKV_HOME (vault folder), SKV_KEY (base64 master key, overrides $SKV_HOME/key).`;
 
-const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since']);
+const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since', 'path']);
 const SHORT = { o: 'output', y: 'yes', h: 'help' };
 
 export function parseArgs(argv) {
@@ -86,6 +93,18 @@ async function confirm(question, flags) {
   } finally {
     rl.close();
   }
+}
+
+/** --path as a normalized absolute folder (default: the current folder). */
+function targetDir(flags) {
+  if (flags.path === true) throw usage('--path needs a folder');
+  return normalizeDir(flags.path ?? '.');
+}
+
+/** Groups from a "a,b" argument, or the ones linked to the current folder when it is absent. */
+function groupsOrLinked(home, spec) {
+  if (spec) return parseGroupList(spec);
+  return linkedGroups(home, normalizeDir('.')).groups.map(assertGroup);
 }
 
 function need(pos, n, text) {
@@ -197,6 +216,58 @@ async function main(argv) {
       return console.log(`removed ${group}/${key}`);
     }
 
+    case 'rollback': {
+      need(pos, 3, 'skv rollback <group> <KEY> [--yes]');
+      if (pos.length > 3) throw usage(`skv rollback: unexpected "${pos[3]}"`);
+      const [group, key] = [assertGroup(pos[1]), assertKey(pos[2])];
+      const vault = openVault(home);
+      const prev = vault.previousVersion(group, key);
+      if (!prev) throw new SkvError('no-history', `${group}/${key} has no previous value to roll back to`);
+      if (!(await confirm(`roll back ${group}/${key} to the value replaced at ${ago(prev.replacedAt)} (fingerprint ${prev.fingerprint})?`, flags))) {
+        return console.log('aborted');
+      }
+      const r = vault.rollback(group, key);
+      log({ action: 'rollback', group, key, fingerprint: r.fingerprint, from: r.from });
+      return console.log(`rolled back ${group}/${key} (fingerprint ${r.from} -> ${r.fingerprint}; run again to undo)`);
+    }
+
+    case 'link': {
+      const dir = targetDir(flags);
+      if (flags.rm) {
+        if (pos.length > 1) throw usage('skv link --rm [--path dir] takes no group');
+        const r = removeLink(home, dir);
+        log({ action: 'link', group: r.groups.join(','), groups: r.groups, path: r.path, removed: true });
+        return console.log(`unlinked ${r.path} (was ${r.groups.join(',')})`);
+      }
+      need(pos, 2, 'skv link <group>[,group...] [--path dir] | skv link --rm [--path dir]');
+      if (pos.length > 2) throw usage(`skv link: unexpected "${pos[2]}" (separate groups with commas)`);
+      const groups = parseGroupList(pos[1]);
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new SkvError('not-found', `${dir} is not a folder`);
+      const vault = openVault(home);
+      const missing = groups.filter((g) => !vault.hasGroup(g));
+      if (missing.length) throw new SkvError('not-found', `no group ${missing.map((g) => `"${g}"`).join(', ')} (see \`skv groups\`)`);
+      const previous = setLink(home, dir, groups);
+      log({ action: 'link', group: groups.join(','), groups, path: dir, ...(previous ? { previous } : {}) });
+      return console.log(`linked ${dir} -> ${groups.join(',')}${previous ? ` (was ${previous.join(',')})` : ''}`);
+    }
+
+    case 'links': {
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      const links = listLinks(home);
+      if (flags.json) return json(links);
+      if (!links.length) return console.log('no links yet (skv link <group> --path <dir>)');
+      return console.log(table(['PATH', 'GROUPS'], links.map((l) => [l.exists ? l.path : `${l.path} ${c.yellow('(missing)')}`, l.groups.join(',')])));
+    }
+
+    case 'which': {
+      if (pos.length > 1) throw usage('usage: skv which [--path dir] [--json]');
+      if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      const dir = targetDir(flags);
+      const link = linkedGroups(home, dir);
+      if (flags.json) return json({ dir, linkedAt: link.path, groups: link.groups });
+      return console.log(`${link.groups.join(',')}${c.dim(`  (linked at ${link.path})`)}`);
+    }
+
     case 'import': {
       need(pos, 3, 'skv import <group> <file.env>');
       const group = assertGroup(pos[1]);
@@ -222,8 +293,8 @@ async function main(argv) {
     }
 
     case 'export': {
-      need(pos, 2, 'skv export <group>[,group...] [--format dotenv|json] [-o file]');
-      const groups = parseGroupList(pos[1]);
+      if (pos.length > 2) throw usage('usage: skv export [group[,group...]] [--format dotenv|json] [-o file]');
+      const groups = groupsOrLinked(home, pos[1]);
       const format = flags.format ?? 'dotenv';
       if (!['dotenv', 'json'].includes(format)) throw usage(`--format must be dotenv or json`);
       const out = flags.output === true ? null : flags.output;
@@ -240,11 +311,10 @@ async function main(argv) {
     }
 
     case 'run': {
-      if (!rest) throw usage('usage: skv run <group>[,group...] -- <cmd> [args...]');
+      if (!rest) throw usage('usage: skv run [group[,group...]] -- <cmd> [args...]');
       if (!rest.length) throw usage('skv run: missing command after --');
-      if (pos.length < 2) throw usage('skv run: missing group (linking groups to a folder comes in a later version)');
       if (pos.length > 2) throw usage(`skv run: unexpected "${pos[2]}" before --`);
-      const groups = parseGroupList(pos[1]);
+      const groups = groupsOrLinked(home, pos[1]);
       const secrets = openVault(home).collect(groups);
       log({ action: 'run', group: groups.join(','), groups, keys: secrets.map((s) => s.key), command: path.basename(rest[0]) });
       const { env, cleanup } = materialize(secrets);
@@ -304,6 +374,8 @@ function detail(e) {
   if (e.command) parts.push(`cmd ${e.command}`);
   if (e.target) parts.push(`-> ${e.target}`);
   if (e.all) parts.push(`whole group (${e.count})`);
+  if (e.from) parts.push(`from fp ${e.from}`);
+  if (e.path) parts.push(`${e.removed ? 'unlinked' : 'linked'} ${e.path}`);
   return parts.join(', ');
 }
 

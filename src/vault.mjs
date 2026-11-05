@@ -3,6 +3,7 @@ import path from 'node:path';
 import { decrypt, encrypt, fingerprint } from './crypto.mjs';
 import { SkvError, usage } from './errors.mjs';
 import { ensurePrivateDir, writeFileAtomic } from './fsutil.mjs';
+import { withLock } from './lock.mjs';
 import { layout } from './paths.mjs';
 
 export const HISTORY_LIMIT = 5;
@@ -30,6 +31,14 @@ export function parseGroupList(spec) {
   return groups.map(assertGroup);
 }
 
+/** A history entry for the current value of `s`. */
+function historyEntry(s, now) {
+  const old = { value: s.value, replacedAt: now };
+  if (s.type !== 'string') old.type = s.type;
+  if (s.filename) old.filename = s.filename;
+  return old;
+}
+
 /** An open vault: a home folder plus its master key. */
 export class Vault {
   constructor(home, key) {
@@ -40,6 +49,16 @@ export class Vault {
 
   groupFile(group) {
     return path.join(this.paths.vault, `${assertGroup(group)}.enc`);
+  }
+
+  lockFile(group) {
+    return path.join(this.paths.vault, `${assertGroup(group)}.lock`);
+  }
+
+  /** Run a read-modify-write of one group under its lock file, so concurrent writers don't lose updates. */
+  locked(group, fn) {
+    ensurePrivateDir(this.paths.vault);
+    return withLock(this.lockFile(group), fn, { what: `group "${group}"`, ...this.lockOptions });
   }
 
   listGroupNames() {
@@ -91,7 +110,7 @@ export class Vault {
   }
 
   deleteGroup(group) {
-    fs.rmSync(this.groupFile(group), { force: true });
+    this.locked(group, () => fs.rmSync(this.groupFile(group), { force: true }));
   }
 
   emptyGroup(group) {
@@ -106,7 +125,11 @@ export class Vault {
    * Store or replace secrets in one group (one read, one write).
    * `entries`: [{ key, value, type = 'string', filename, note }]. Returns per-key results (never values).
    */
-  setSecrets(group, entries, { description } = {}) {
+  setSecrets(group, entries, options = {}) {
+    return this.locked(group, () => this.#setSecrets(group, entries, options));
+  }
+
+  #setSecrets(group, entries, { description } = {}) {
     const data = this.readGroup(group) ?? this.emptyGroup(group);
     if (description !== undefined) data.description = description;
     const now = new Date().toISOString();
@@ -119,10 +142,7 @@ export class Vault {
       if (!prev) {
         data.secrets[key] = { type, value, createdAt: now, updatedAt: now, history: [] };
       } else if (changed) {
-        const old = { value: prev.value, replacedAt: now };
-        if (prev.type !== 'string') old.type = prev.type;
-        if (prev.filename) old.filename = prev.filename;
-        prev.history = [old, ...(prev.history ?? [])].slice(0, HISTORY_LIMIT);
+        prev.history = [historyEntry(prev, now), ...(prev.history ?? [])].slice(0, HISTORY_LIMIT);
         Object.assign(prev, { type, value, updatedAt: now });
       }
       const s = data.secrets[key];
@@ -142,10 +162,44 @@ export class Vault {
   }
 
   removeSecret(group, key) {
-    const data = this.requireGroup(group);
-    if (!data.secrets[assertKey(key)]) throw new SkvError('not-found', `no key ${key} in group "${group}"`);
-    delete data.secrets[key];
-    this.writeGroup(data);
+    assertKey(key);
+    this.locked(group, () => {
+      const data = this.requireGroup(group);
+      if (!data.secrets[key]) throw new SkvError('not-found', `no key ${key} in group "${group}"`);
+      delete data.secrets[key];
+      this.writeGroup(data);
+    });
+  }
+
+  /** The value `rollback` would restore: { replacedAt, fingerprint } (never the value), or null without history. */
+  previousVersion(group, key) {
+    const h = (this.getSecret(group, key).history ?? [])[0];
+    return h ? { replacedAt: h.replacedAt, fingerprint: this.fingerprint(h.value) } : null;
+  }
+
+  /**
+   * Restore the most recent previous value of a key. The current value goes into the history,
+   * so a second rollback undoes the first. Returns { key, fingerprint, from, replacedAt } (never values).
+   */
+  rollback(group, key) {
+    assertKey(key);
+    return this.locked(group, () => {
+      const data = this.requireGroup(group);
+      const s = data.secrets[key];
+      if (!s) throw new SkvError('not-found', `no key ${key} in group "${group}" (see \`skv ls ${group}\`)`);
+      const [prev, ...older] = s.history ?? [];
+      if (!prev) throw new SkvError('no-history', `${group}/${key} has no previous value to roll back to`);
+      const now = new Date().toISOString();
+      const from = this.fingerprint(s.value);
+      s.history = [historyEntry(s, now), ...older].slice(0, HISTORY_LIMIT);
+      s.type = prev.type ?? 'string';
+      s.value = prev.value;
+      if (prev.filename) s.filename = prev.filename;
+      else delete s.filename;
+      s.updatedAt = now;
+      this.writeGroup(data);
+      return { key, fingerprint: this.fingerprint(s.value), from, replacedAt: prev.replacedAt };
+    });
   }
 
   /** Summary of every group: name, description, count, last change. Never values. */

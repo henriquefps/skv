@@ -18,8 +18,11 @@ says to run `skv init`, ask the user before running it: it creates a new master 
 
 1. **Find a credential by name, never by reading files.** `skv groups`, then `skv ls <group>` (add `--json` to parse).
    These never show values. Never `cat`, copy or open anything under `~/.skv`.
-2. **Use it through `skv run`** so the value never appears in the transcript:
+2. **Use it through `skv run`** so the value never appears in the transcript. Inside a project folder, first run
+   `skv which`: if it prints groups, the folder is linked and you can (and should) omit the group:
    ```
+   skv which                         # e.g. "openai,cloudflare  (linked at /path/to/project)"
+   skv run -- npm run deploy         # uses the linked groups, from any subfolder
    skv run openai -- node scripts/eval.mjs
    skv run cloudflare,openai -- npm run deploy
    ```
@@ -35,7 +38,10 @@ says to run `skv init`, ask the user before running it: it creates a new master 
    Pick an existing group when one fits (`skv groups`); otherwise a short lowercase name (`a-z0-9-`).
 4. **When a tool insists on a `.env` file:** `skv export <group> -o <path>` to a git-ignored path (skv refuses
    any other path inside a git repo), and tell the user where the file went so they can delete it later.
-5. **Never** commit values, write them to logs, or paste them into PRs, issues, docs or chat. Do not print
+5. **Linking a project** (`skv link <group>[,group...] --path <dir>`) changes the user's config: do it when the
+   user asks or agrees. `skv rollback <group> <KEY>` restores the previous value after a bad rotation; it needs the
+   user's confirmation (do not pass `--yes` unless they agreed).
+6. **Never** commit values, write them to logs, or paste them into PRs, issues, docs or chat. Do not print
    `skv export` to stdout unless the user asks.
 
 ## Commands
@@ -44,15 +50,18 @@ says to run `skv init`, ask the user before running it: it creates a new master 
 | --- | --- |
 | `skv groups [--json]` | groups with secret count and last change |
 | `skv ls [group] [--json]` | key names, type, note, last change (no values) |
-| `skv run <group>[,group...] -- <cmd> [args]` | run a command with the secrets as env vars; forwards its exit code |
+| `skv which [--path dir] [--json]` | groups linked to this folder (or its nearest linked parent) |
+| `skv run [group[,group...]] -- <cmd> [args]` | run a command with the secrets as env vars (no group: the linked ones); forwards its exit code |
 | `skv set <group> <KEY> [--note t] [--desc t]` | store a value from stdin (or a hidden prompt for the user) |
 | `skv set-file <group> <KEY> <path>` | store a file |
 | `skv get <group> <KEY>` | print one value (logged) |
 | `skv import <group> <file.env>` | import a dotenv file; reports added / changed / unchanged |
-| `skv export <group>[,group...] [--format dotenv\|json] -o <file>` | write a git-ignored dotenv/JSON file (0600) |
+| `skv export [group[,group...]] [--format dotenv\|json] -o <file>` | write a git-ignored dotenv/JSON file (0600); no group: the linked ones |
+| `skv link <group>[,group...] [--path dir]` / `skv link --rm [--path dir]` / `skv links` | link groups to a project folder, unlink, list |
+| `skv rollback <group> <KEY>` | restore the previous value (again to undo); asks for confirmation |
 | `skv rm <group> <KEY>` / `skv rm <group> --all` | delete; asks for confirmation (do not pass `--yes` unless the user agreed) |
 | `skv log [group] [--since 7d] [--json]` | audit log: who read, injected or changed what (never values) |
-| `skv doctor` | permissions, key present, every group decrypts |
+| `skv doctor` | permissions, key present, every group decrypts, orphan links |
 
 Every read, injection and change is written to the audit log with `actor: agent` when run by you. Exit codes:
 0 ok, 1 error, 2 usage; `skv run` returns the command's own exit code.
