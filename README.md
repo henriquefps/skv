@@ -96,7 +96,8 @@ go to a temp file in the same folder and are renamed into place. Each key keeps 
 (`rollback` comes in a later version).
 
 Audit log lines: `{ ts, action, group, key, host, actor, user, cwd, ... }`. `actor` is `agent` when the process runs
-under a coding agent (`CLAUDECODE`, `CODEX_*` or `ORCA_*` env vars), otherwise `user`. `set` and `import` add
+under a coding agent (`CLAUDECODE` or `CODEX_*` env vars), otherwise `user` (`ORCA_*` is ignored: Orca sets it in
+every terminal, including yours; `SKV_ACTOR` overrides). `set` and `import` add
 `changed` and a `fingerprint` (first 8 hex of HMAC-SHA256(master key, value)) to tell whether two values are the
 same. `run` and `export` record the key names and the command's base name (never its arguments). Values are never
 logged.

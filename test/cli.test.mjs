@@ -182,8 +182,8 @@ test('run: a child killed by a signal is reported', { skip: !POSIX }, () => {
 
 test('audit log records actions, actor and fingerprints, never values', () => {
   const home = initHome();
-  const agentFree = Object.fromEntries(Object.keys(process.env).filter((k) => k === 'CLAUDECODE' || /^(CODEX|ORCA)_/.test(k)).map((k) => [k, undefined]));
-  ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { ...agentFree, SKV_ACTOR: '' } }));
+  const agentFree = Object.fromEntries(Object.keys(process.env).filter((k) => k === 'CLAUDECODE' || /^CODEX_/.test(k)).map((k) => [k, undefined]));
+  ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { ...agentFree, SKV_ACTOR: '', ORCA_TERMINAL_ID: 'x' } }));
   ok(skv(home, ['set', 'g', 'K'], { input: SECRET, env: { CLAUDECODE: '1' } }));
   ok(skv(home, ['get', 'g', 'K']));
   ok(skv(home, ['run', 'g', '--', process.execPath, '-e', '0']));
@@ -234,4 +234,14 @@ test('doctor reports a tampered group as an error', () => {
   const r = skv(home, ['doctor']);
   assert.equal(r.status, 1);
   assert.match(r.stdout, /error decrypt +g\.enc/);
+});
+
+test('detectActor: agent markers only; ORCA_* alone is a user; SKV_ACTOR overrides', async () => {
+  const { detectActor } = await import('../src/log.mjs');
+  assert.equal(detectActor({ ORCA_TERMINAL_ID: 'x', ORCA_SESSION: 'y' }), 'user');
+  assert.equal(detectActor({ CLAUDECODE: '1' }), 'agent');
+  assert.equal(detectActor({ CODEX_SANDBOX: 'seatbelt' }), 'agent');
+  assert.equal(detectActor({ CLAUDECODE: '1', SKV_ACTOR: 'user' }), 'user');
+  assert.equal(detectActor({ SKV_ACTOR: 'agent' }), 'agent');
+  assert.equal(detectActor({}), 'user');
 });

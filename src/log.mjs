@@ -6,10 +6,14 @@ import { isWindows, layout } from './paths.mjs';
 
 export const ACTIONS = ['init', 'set', 'set-file', 'rm', 'import', 'export', 'get', 'run', 'rollback', 'link'];
 
-/** `agent` when the process runs under a coding agent (CLAUDECODE, CODEX_*, ORCA_*), otherwise `user`. */
+/**
+ * `agent` when the process runs under a coding agent (CLAUDECODE set by Claude Code, CODEX_* set by Codex),
+ * otherwise `user`. ORCA_* is deliberately ignored: Orca exports it in every terminal, including the ones people type in.
+ * SKV_ACTOR=user|agent overrides the detection.
+ */
 export function detectActor(env = process.env) {
   if (env.SKV_ACTOR === 'agent' || env.SKV_ACTOR === 'user') return env.SKV_ACTOR;
-  return Object.keys(env).some((k) => k === 'CLAUDECODE' || k.startsWith('CODEX_') || k.startsWith('ORCA_')) ? 'agent' : 'user';
+  return Object.keys(env).some((k) => k === 'CLAUDECODE' || k.startsWith('CODEX_')) ? 'agent' : 'user';
 }
 
 /**

@@ -109,7 +109,8 @@ Each line: `{ "ts", "action", "group", "key", "host", "actor", "cwd" }`.
 
 - `action`: `init|set|set-file|rm|import|export|get|run|rollback|link`.
 - `actor`: `agent` when the process looks like it runs under an agent (`CLAUDECODE`,
-  `CODEX_*`, `ORCA_*` env vars), otherwise `user`; plus `process.env.USER`.
+  `CODEX_*` env vars), otherwise `user`; plus `process.env.USER`. `ORCA_*` is not a marker: Orca
+  exports it in every terminal, including the user's own. `SKV_ACTOR=user|agent` overrides.
 - `set` adds `"changed": true|false` and a short fingerprint (first 8 hex of
   HMAC-SHA256(master key, value)) so you can tell whether two values are the same
   without storing them. Never the value itself.
