@@ -40,10 +40,11 @@ const homeHash = (home) => crypto.createHash('sha256').update(path.resolve(home)
 export function sessionEndpoint(home, { platform = process.platform, tmpdir = os.tmpdir() } = {}) {
   const hash = homeHash(home);
   if (isWindows(platform)) return { socket: `\\\\.\\pipe\\skv-${hash}`, dir: null };
-  const preferred = path.join(home, 'session.sock');
+  const p = path.posix; // Unix socket paths, even when computed for another platform (tests)
+  const preferred = p.join(home, 'session.sock');
   if (Buffer.byteLength(preferred) <= MAX_SOCKET_PATH) return { socket: preferred, dir: null };
-  const dir = path.join(tmpdir, `skv-${hash}`);
-  return { socket: path.join(dir, 's.sock'), dir };
+  const dir = p.join(tmpdir, `skv-${hash}`);
+  return { socket: p.join(dir, 's.sock'), dir };
 }
 
 /** Create (or check) the private fallback folder for the socket: a real folder we own, mode 0700. */
