@@ -155,7 +155,9 @@ test('run injects env vars and forwards the exit code', () => {
   assert.equal(skv(home, ['run', 'a', '--', process.execPath, '-e', 'process.exit(7)']).status, 7);
   assert.equal(skv(home, ['run', 'a', '--', 'skv-no-such-command-xyz']).status, 127);
   assert.equal(skv(home, ['run', 'a']).status, 2);
-  assert.equal(skv(home, ['run', '--', 'node']).status, 2);
+  const unlinked = skv(home, ['run', '--', 'node']);
+  assert.equal(unlinked.status, 1, 'no group and no link');
+  assert.match(unlinked.stderr, /no groups linked/);
 });
 
 test('run: file secrets are a 0600 temp file during the run and gone after', () => {

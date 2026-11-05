@@ -97,7 +97,10 @@ skv run <group>[,group...] -- <cmd> [args]  run a command with the secrets as en
 skv log [group] [--since 7d] [--json]       audit log
 skv rollback <group> <KEY>                  restore the previous value
 skv link <group>[,group...] [--path dir]    bind groups to a project folder (stored in config.json)
-skv run -- <cmd>                            with no group: use the groups linked to the cwd
+skv link --rm [--path dir] | skv links      unlink a folder / list links
+skv which [--path dir]                      the groups that apply to a folder
+skv run -- <cmd> / skv export               with no group: use the groups linked to the cwd
+                                            or its nearest linked ancestor
 skv doctor                                  permissions, key present, files decrypt, orphan links
 ```
 
@@ -137,7 +140,12 @@ Phase 1 (MVP): `init`, crypto + vault store, `set`, `set-file`, `get`, `ls`, `gr
 `import`, `export`, `run`, `log`, `doctor`; tests with `node --test` using a temp `SKV_HOME`;
 README; `skills/skv/SKILL.md`; `npm link` installs `skv` on PATH.
 
-Phase 2: `link` + cwd resolution, `rollback`, migration of `~/.openlive-keys`.
+Phase 2 (done): `link` / `links` / `which` + cwd resolution for `run` and `export` (nearest linked ancestor;
+paths normalized with `path.resolve` + `realpath`, compared case-insensitively on Windows and macOS), `rollback`
+(the current value goes into the history, so rolling back twice undoes it), `doctor` reports orphan links,
+a lock file per group (`vault/<group>.lock`, `wx`, stale after 30 s, waited on for up to 5 s) around every
+read-modify-write so concurrent `skv set` don't lose writes. Migration of `~/.openlive-keys` is done separately
+(by hand, with `skv set-file`).
 
 ## Later
 

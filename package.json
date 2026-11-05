@@ -1,6 +1,6 @@
 {
   "name": "skv",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Secrets keeper vault: local, encrypted, cross-platform secrets manager with a CLI and an audit log",
   "type": "module",
   "bin": { "skv": "bin/skv.mjs" },
