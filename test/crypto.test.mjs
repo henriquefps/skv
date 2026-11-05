@@ -39,10 +39,10 @@ test('wrong key is rejected', () => {
   assert.throws(() => decrypt(generateKey(), env, 'g'), { code: 'decrypt' });
 });
 
-test('AAD binds the envelope to its group: swapping files is detected', () => {
+test('AAD binds the envelope to its group: swapping files is detected', async () => {
   const home = tmpHome();
   initHomeCore(home, {});
-  const vault = openVault(home, {});
+  const vault = await openVault(home, {});
   vault.setSecrets('alpha', [{ key: 'A', value: 'aaa' }]);
   vault.setSecrets('beta', [{ key: 'B', value: 'bbb' }]);
   const dir = path.join(home, 'vault');
@@ -71,10 +71,10 @@ test('key providers: SKV_KEY wins over the key file; bad keys are clear errors',
   assert.throws(() => loadKey(tmpHome(), {}), { code: 'no-key' });
 });
 
-test('vault files contain no plaintext', () => {
+test('vault files contain no plaintext', async () => {
   const home = tmpHome();
   initHomeCore(home, {});
-  const vault = openVault(home, {});
+  const vault = await openVault(home, {});
   vault.setSecrets('g', [{ key: 'TOKEN', value: 'plaintext-marker-123' }]);
   const raw = fs.readFileSync(path.join(home, 'vault', 'g.enc'), 'utf8');
   assert.doesNotMatch(raw, /plaintext-marker|TOKEN/);

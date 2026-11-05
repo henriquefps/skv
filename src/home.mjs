@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SkvError } from './errors.mjs';
 import { ensurePrivateDir, isTempFile, modeOf, writeFileAtomic } from './fsutil.mjs';
-import { fileKeyProvider, findKeyProvider, generateKey, loadKey } from './keys.mjs';
+import { envKeyProvider, fileKeyProvider, generateKey, readKeyFile, resolveKey } from './keys.mjs';
 import { CONFIG_VERSION, defaultConfig, listLinks } from './links.mjs';
 import { isLockFile, LOCK_STALE_MS } from './lock.mjs';
 import { isWindows, layout } from './paths.mjs';
+import { querySession, sessionEndpoint } from './session.mjs';
 import { Vault } from './vault.mjs';
 
 export { CONFIG_VERSION };
@@ -19,11 +20,14 @@ export function initHome(home, env = process.env) {
   const created = [];
   ensurePrivateDir(home);
   ensurePrivateDir(p.vault);
-  const provider = findKeyProvider(home, env);
+  const envP = envKeyProvider(env);
+  const existing = readKeyFile(home);
   let keySource;
-  if (provider) {
-    provider.load();
-    keySource = provider.name;
+  if (envP.available()) {
+    envP.load();
+    keySource = 'env';
+  } else if (existing) {
+    keySource = existing.kind === 'wrapped' ? 'passphrase' : 'file';
   } else {
     const groups = fs.readdirSync(p.vault).filter((f) => f.endsWith('.enc'));
     if (groups.length) {
@@ -40,14 +44,45 @@ export function initHome(home, env = process.env) {
   return { home, created, keySource };
 }
 
-/** Open the vault for reading/writing: the home must exist and a key must be available. */
-export function openVault(home, env = process.env) {
+/**
+ * Open the vault for reading/writing: the home must exist and a key must be available
+ * (SKV_KEY -> unlock session -> plain key file; a passphrase-protected key file without a session is 'locked').
+ */
+export async function openVault(home, env = process.env) {
   if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
-  return new Vault(home, loadKey(home, env));
+  const { key, source } = await resolveKey(home, env);
+  const vault = new Vault(home, key);
+  vault.keySource = source;
+  return vault;
+}
+
+/**
+ * Passphrase and session state, never the key:
+ * { keyFile: missing|raw|wrapped|invalid, passphrase: bool, session: {...querySession}, source: env|session|file|locked|none }
+ */
+export async function keyStatus(home, env = process.env) {
+  let keyFile;
+  let keyError;
+  try {
+    const k = readKeyFile(home);
+    keyFile = !k ? 'missing' : k.kind;
+  } catch (err) {
+    keyFile = 'invalid';
+    keyError = err.message;
+  }
+  const session = await querySession(home);
+  delete session.key;
+  let source;
+  if (env.SKV_KEY) source = 'env';
+  else if (session.state === 'active') source = 'session';
+  else if (keyFile === 'raw') source = 'file';
+  else if (keyFile === 'wrapped') source = 'locked';
+  else source = 'none';
+  return { home, keyFile, ...(keyError ? { keyError } : {}), passphrase: keyFile === 'wrapped', session, source };
 }
 
 /** Health checks: [{ level: ok|warn|error, check, message }]. */
-export function doctor(home, env = process.env) {
+export async function doctor(home, env = process.env) {
   const p = layout(home);
   const out = [];
   const add = (level, check, message) => out.push({ level, check, message });
@@ -70,17 +105,30 @@ export function doctor(home, env = process.env) {
   checkMode(p.vault, 0o700, 'folder');
 
   let key = null;
-  const provider = findKeyProvider(home, env);
-  if (!provider) add('error', 'key', `no key: SKV_KEY is unset and ${p.key} is missing`);
-  else {
+  const status = await keyStatus(home, env);
+  if (status.keyFile === 'invalid') add('error', 'key', status.keyError);
+  if (status.keyFile !== 'invalid' || env.SKV_KEY) {
     try {
-      key = provider.load();
-      add('ok', 'key', `key from ${provider.describe}`);
+      const r = await resolveKey(home, env);
+      key = r.key;
+      const from = { env: 'SKV_KEY environment variable', session: 'the unlock session', file: p.key }[r.source];
+      add('ok', 'key', `key from ${from}`);
     } catch (err) {
-      add('error', 'key', err.message);
+      if (err.code === 'locked') add('warn', 'key', `${err.message} to check that every group decrypts`);
+      else add('error', 'key', err.code === 'no-key' ? `no key: SKV_KEY is unset and ${p.key} is missing` : err.message);
     }
   }
   checkMode(p.key, 0o600, 'key');
+  add('ok', 'passphrase', status.passphrase ? 'on: the key file is passphrase-protected (scrypt)' : 'off: the key file holds the raw key');
+  const s = status.session;
+  if (s.state === 'active') add('ok', 'session', `unlocked until ${s.expiresAt} (pid ${s.pid})`);
+  else if (s.state === 'stale') add('warn', 'session', `stale session files (${s.reason}); \`skv lock\` removes them`);
+  else add('ok', 'session', status.passphrase ? 'locked (no unlock session)' : 'none');
+  if (s.state !== 'none') checkMode(p.session, 0o600, 'session');
+  if (!isWindows()) {
+    const { socket } = sessionEndpoint(home);
+    if (s.state === 'none' && fs.existsSync(socket)) add('warn', 'session', `leftover socket ${socket} without a session (\`skv lock\` removes it)`);
+  }
 
   let configOk = false;
   if (!fs.existsSync(p.config)) add('warn', 'config', `${p.config} is missing (run \`skv init\`)`);

@@ -19,8 +19,9 @@ them without copying `.env` files into repos.
 
 ## Non-goals (for v1)
 
-- Protecting secrets from an agent that the user lets run `skv get`: the vault prevents
-  leaks (repo commits, backups, stray `.env` files), it is not a sandbox.
+- Protecting secrets from an agent that runs as the user: the vault prevents leaks (repo commits, backups,
+  stray `.env` files, accidental reads into transcripts), it is not a sandbox. The agent read policy (Phase 3)
+  is a guard against accidents, not a security boundary.
 - Sync between machines, sharing with other people, a web UI. See "Later".
 
 ## Storage layout
@@ -70,8 +71,9 @@ Decrypted group format:
 - AES-256-GCM via `node:crypto`, random 12-byte IV per write, 16-byte auth tag.
 - `.enc` file = JSON envelope `{ "v": 1, "alg": "aes-256-gcm", "iv", "tag", "data" }` (base64),
   with the group name as additional authenticated data so files can't be swapped.
-- Master key source, in order: `SKV_KEY` env var (base64) → `~/.skv/key`. A missing key is a
-  clear error that points to `skv init`.
+- Master key source, in order: `SKV_KEY` env var (base64) → unlock session (`skv unlock`, Phase 3) →
+  `~/.skv/key`. A missing key is a clear error that points to `skv init`; a passphrase-protected key file
+  without a session is "the vault is locked: run `skv unlock`".
 - Writes are atomic (write temp file in the same folder, then rename).
 - Key providers are a small interface (`load()`, `store()`) so a passphrase-derived key
   (scrypt) or OS keychains can be added later without changing the vault format.
@@ -147,9 +149,33 @@ a lock file per group (`vault/<group>.lock`, `wx`, stale after 30 s, waited on f
 read-modify-write so concurrent `skv set` don't lose writes. Migration of `~/.openlive-keys` is done separately
 (by hand, with `skv set-file`).
 
-## Later
+Phase 3 (done): hardening.
 
-- Passphrase-protected master key (scrypt) with an unlock session (like `ssh-agent`), opt-in.
+- **Agent read policy** (on by default). When the actor is `agent`, `skv get` is refused (exit 1, pointing to
+  `skv run <group> -- <cmd>`) and `skv export` to stdout is refused; `export -o <file>` stays allowed (git-ignore
+  check applies). Refusals are logged with `denied: true`. Setting `settings.agentRead: "deny" | "allow"` in
+  `config.json`, changed with `skv config set agent-read allow|deny` (`allow` is refused and logged as denied when the actor is an agent; `deny` is allowed) and shown
+  by `skv config`. Users are unaffected. It is a guard against accidental reads into transcripts, not a security
+  boundary: an agent runs as the user and could read the key file or set `SKV_ACTOR=user`.
+- **Optional passphrase** (off by default). `skv passphrase set|change|remove` (hidden prompt, or one passphrase per
+  line on stdin for scripts; minimum 8 characters). The key file becomes a JSON envelope
+  `{ v: 1, kdf: "scrypt", params: { N: 2^17, r: 8, p: 1, keylen: 32 }, salt (16 B), iv, tag, data }`: the master key
+  wrapped with AES-256-GCM under a scrypt-derived key. The master key does not change, so the vault is not
+  re-encrypted and a raw-key backup (`SKV_KEY`) keeps working. Writes are atomic.
+- **Unlock session**, like `ssh-agent`. `skv unlock [--for 8h]` (`30m`, `12h`, `1d`, max 30d) checks the passphrase
+  and starts a detached background process (`src/session-server.mjs`) that holds the master key only in memory;
+  the key reaches it over its stdin pipe, never argv or env. It listens on `$SKV_HOME/session.sock` (0600, created
+  under umask 077), or, when that path is too long for a Unix socket (~104 bytes on macOS), on
+  `<tmpdir>/skv-<hash of SKV_HOME>/s.sock` in a private 0700 folder; on Windows on the named pipe
+  `\\.\pipe\skv-<hash>`. Every request carries a random 256-bit token stored in `$SKV_HOME/session.json` (0600),
+  compared in constant time, so processes that can't read that file can't use the socket. Protocol: one JSON line
+  per connection, `{ token, op: status|key|lock }`. The session exits on expiry, `skv lock`, or SIGTERM/SIGHUP, and
+  removes its files. `skv status` shows locked / unlocked / no passphrase, the expiry and the key source; `doctor`
+  reports passphrase on/off, the session and stale session files. `log`, `links`, `which`, `doctor` and `status`
+  work while locked. New log actions: `config`, `passphrase-set`, `passphrase-change`, `passphrase-remove`,
+  `unlock`, `lock` (never passphrases or keys).
+
+## Later
 - Optional OS keychain providers (macOS Keychain, libsecret, Windows DPAPI), opt-in, never required.
 - Sync to the other machines (cachyos-fps, Windows VM) over Tailscale/SSH; the `.enc` files are
   safe to copy, the key travels separately.

@@ -47,3 +47,25 @@ export async function readSecretValue(label) {
   if (!value) throw new SkvError('empty', 'empty value: pipe it on stdin (printf \'%s\' "$VALUE" | skv set ...) or type it at the prompt');
   return value;
 }
+
+/**
+ * Read passphrases for `steps` ([{ label, confirm }]). On a TTY each one is a hidden prompt (asked twice when
+ * `confirm`); otherwise stdin is read once and each step takes the next line (for scripts; no confirmation).
+ */
+export async function readPassphrases(steps) {
+  const out = [];
+  if (process.stdin.isTTY) {
+    for (const { label, confirm } of steps) {
+      const v = await hiddenPrompt(`${label}: `);
+      if (confirm && (await hiddenPrompt(`repeat ${label}: `)) !== v) throw new SkvError('mismatch', 'the passphrases do not match');
+      out.push(v);
+    }
+    return out;
+  }
+  const lines = (await readStdin()).toString('utf8').split(/\r?\n/);
+  for (const [i, { label }] of steps.entries()) {
+    if (!lines[i]) throw new SkvError('empty', `missing ${label}: type it at the prompt, or pipe one passphrase per line on stdin`);
+    out.push(lines[i]);
+  }
+  return out;
+}

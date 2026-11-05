@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { initHome, openVault } from '../src/home.mjs';
-import { HISTORY_LIMIT, isGroupName, isKeyName, parseGroupList } from '../src/vault.mjs';
+import { initHome } from '../src/home.mjs';
+import { loadKey } from '../src/keys.mjs';
+import { HISTORY_LIMIT, isGroupName, isKeyName, parseGroupList, Vault } from '../src/vault.mjs';
 import { tmpHome } from './helpers.mjs';
 
 const fresh = () => {
   const home = tmpHome();
   initHome(home, {});
-  return openVault(home, {});
+  return new Vault(home, loadKey(home, {}));
 };
 
 test('name rules', () => {
