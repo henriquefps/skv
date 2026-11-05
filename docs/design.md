@@ -154,7 +154,7 @@ Phase 3 (done): hardening.
 - **Agent read policy** (on by default). When the actor is `agent`, `skv get` is refused (exit 1, pointing to
   `skv run <group> -- <cmd>`) and `skv export` to stdout is refused; `export -o <file>` stays allowed (git-ignore
   check applies). Refusals are logged with `denied: true`. Setting `settings.agentRead: "deny" | "allow"` in
-  `config.json`, changed with `skv config set agent-read allow|deny` (refused when the actor is an agent) and shown
+  `config.json`, changed with `skv config set agent-read allow|deny` (`allow` is refused and logged as denied when the actor is an agent; `deny` is allowed) and shown
   by `skv config`. Users are unaffected. It is a guard against accidental reads into transcripts, not a security
   boundary: an agent runs as the user and could read the key file or set `SKV_ACTOR=user`.
 - **Optional passphrase** (off by default). `skv passphrase set|change|remove` (hidden prompt, or one passphrase per

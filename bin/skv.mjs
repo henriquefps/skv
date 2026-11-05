@@ -386,7 +386,10 @@ async function main(argv) {
         need(pos, 4, 'skv config set <setting> <value>   (agent-read allow|deny)');
         const [name, value] = [pos[2], pos[3]];
         settingFor(name);
-        if (detectActor() === 'agent') throw new SkvError('denied', `only the user can change ${name}: ask them to run \`skv config set ${name} ${value}\``);
+        if (name === 'agent-read' && value === 'allow' && detectActor() === 'agent') {
+          log({ action: 'config', setting: name, setTo: value, denied: true });
+          throw new SkvError('denied', 'only the user can allow agent reads, from their own terminal: ask them to run `skv config set agent-read allow`');
+        }
         const previous = writeSetting(home, name, value);
         log({ action: 'config', setting: name, setTo: value, previous });
         return console.log(`${name}: ${previous} -> ${value}`);
@@ -489,7 +492,7 @@ function detail(e) {
   if (e.from) parts.push(`from fp ${e.from}`);
   if (e.path) parts.push(`${e.removed ? 'unlinked' : 'linked'} ${e.path}`);
   if (e.denied) parts.push('DENIED (agent-read)');
-  if (e.setting) parts.push(`${e.setting}: ${e.previous} -> ${e.setTo}`);
+  if (e.setting) parts.push(e.previous ? `${e.setting}: ${e.previous} -> ${e.setTo}` : `${e.setting} -> ${e.setTo}`);
   if (e.action === 'unlock' && e.expiresAt) parts.push(`until ${e.expiresAt}`);
   return parts.join(', ');
 }

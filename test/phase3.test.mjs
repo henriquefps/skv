@@ -269,7 +269,12 @@ test('agentRead allow lets agents read; only users can change it; users are neve
   assert.match(skv(home, ['config']).stdout, /agent-read\s+deny/);
   const byAgent = skv(home, ['config', 'set', 'agent-read', 'allow'], agent);
   assert.equal(byAgent.status, 1);
-  assert.match(byAgent.stderr, /only the user/);
+  assert.match(byAgent.stderr, /only the user can allow agent reads, from their own terminal/);
+  assert.equal(skv(home, ['config', 'set', 'agent-read', 'allow'], { env: { SKV_ACTOR: '', CLAUDECODE: '1' } }).status, 1);
+  assert.equal(JSON.parse(skv(home, ['config', '--json']).stdout)['agent-read'], 'deny', 'unchanged');
+  ok(skv(home, ['config', 'set', 'agent-read', 'deny'], agent)); // tightening is fine for agents
+  const deniedCfg = logEntries(home).filter((e) => e.action === 'config' && e.denied);
+  assert.deepEqual(deniedCfg.map((e) => [e.actor, e.setting, e.setTo]), [['agent', 'agent-read', 'allow'], ['agent', 'agent-read', 'allow']]);
   assert.equal(skv(home, ['config', 'set', 'agent-read', 'maybe']).status, 2);
   assert.equal(skv(home, ['config', 'set', 'nope', 'x']).status, 2);
 
@@ -283,6 +288,6 @@ test('agentRead allow lets agents read; only users can change it; users are neve
   ok(skv(home, ['config', 'set', 'agent-read', 'deny']));
   assert.equal(skv(home, ['get', 'g', 'K'], agent).status, 1);
   ok(skv(home, ['get', 'g', 'K']));
-  const cfg = logEntries(home).filter((e) => e.action === 'config');
+  const cfg = logEntries(home).filter((e) => e.action === 'config' && !e.denied && e.actor === 'user');
   assert.deepEqual(cfg.map((e) => [e.setting, e.previous, e.setTo]), [['agent-read', 'deny', 'allow'], ['agent-read', 'allow', 'deny']]);
 });

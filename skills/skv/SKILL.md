@@ -34,8 +34,8 @@ look for the key some other way. `skv status` tells you whether the vault is loc
    the command ends, and the variable holds its path.
 3. **`skv get` and `skv export` to stdout are refused for you** (the default agent read policy; the refusal is
    logged). Never try to get around it: don't set `SKV_ACTOR`, don't read `~/.skv`, don't print the variables
-   inside `skv run`, and don't run `skv config set agent-read allow` (it is refused for agents anyway; only the
-   user decides). Most tools read their env var directly. To hand a secret to a tool that wants it on stdin, pipe
+   inside `skv run`, and don't run `skv config set agent-read allow` (it is refused for agents and logged as a denied change;
+   only the user can allow it, from their own terminal). Most tools read their env var directly. To hand a secret to a tool that wants it on stdin, pipe
    it inside `skv run`, so the value only travels between processes:
    ```
    skv run <group> -- sh -c 'printf %s "$KEY" | tool login --password-stdin'

@@ -88,7 +88,7 @@ skv lock
 | `skv log [group] [--since 30m\|12h\|7d\|2w\|date] [--json]` | Audit log. |
 | `skv doctor [--json]` | Checks folder/file permissions, key present and valid, config, every group decrypts, leftover temp and stale lock files, links whose folder or groups are gone (warnings), passphrase on/off, the unlock session and stale session files. While locked, the decrypt checks are skipped with a warning. Exit 1 on errors. |
 | `skv config [--json]` | Show the settings (`agent-read`). |
-| `skv config set agent-read allow\|deny` | Let agents print values (`allow`) or not (`deny`, the default). Refused when run by an agent. |
+| `skv config set agent-read allow\|deny` | Let agents print values (`allow`) or not (`deny`, the default). An agent can't set `allow` (exit 1, logged as a denied config change); only the user can, from their own terminal. Agents may tighten it to `deny`. |
 | `skv passphrase set` | Protect the key file with a passphrase (hidden prompt twice, or one line on stdin; at least 8 characters). The master key and the vault don't change. |
 | `skv passphrase change` | Current passphrase, then the new one (stdin: two lines). A running session keeps working. |
 | `skv passphrase remove` | After the current passphrase, write the raw key back to the key file and end any session. |
@@ -146,7 +146,7 @@ When skv runs under a coding agent (actor `agent`: `CLAUDECODE` or `CODEX_*` in 
 `skv export` to stdout exits 1 (`export -o <git-ignored file>` still works). Each refusal is logged (`denied: true`,
 never the value). `skv run` is unaffected, and so are users.
 
-`skv config set agent-read allow` turns the guard off (`deny` turns it back on); an agent can't change it.
+`skv config set agent-read allow` turns the guard off (`deny` turns it back on). Only the user can allow it, from their own terminal: when run by an agent, `allow` is refused (exit 1) and logged as a denied config change, so an agent can't undo its own guard; tightening to `deny` is allowed.
 
 This is a guard against **accidental** reads ending up in an agent transcript, **not a security boundary**: the agent
 runs as your user, so it could read the key file, set `SKV_ACTOR=user`, or print the variables inside `skv run`.
