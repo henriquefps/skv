@@ -133,8 +133,8 @@ Each line: `{ "ts", "action", "group", "key", "host", "actor", "cwd" }`.
 
 ## Migration
 
-- `~/.openlive-keys/` (`openlive-upload.jks`, `openlive-upload.properties`) → group `openlive`.
-- Scan other projects for `.env` files the user wants to centralize (on request).
+- Existing `.env` files: `skv import <group> <file>`, then `skv link <group>` in the project folder.
+- Loose credential files (keystores, certificates): `skv set-file <group> <KEY> <path>`.
 
 ## Implementation plan
 
@@ -146,8 +146,7 @@ Phase 2 (done): `link` / `links` / `which` + cwd resolution for `run` and `expor
 paths normalized with `path.resolve` + `realpath`, compared case-insensitively on Windows and macOS), `rollback`
 (the current value goes into the history, so rolling back twice undoes it), `doctor` reports orphan links,
 a lock file per group (`vault/<group>.lock`, `wx`, stale after 30 s, waited on for up to 5 s) around every
-read-modify-write so concurrent `skv set` don't lose writes. Migration of `~/.openlive-keys` is done separately
-(by hand, with `skv set-file`).
+read-modify-write so concurrent `skv set` don't lose writes.
 
 Phase 3 (done): hardening.
 
@@ -177,7 +176,6 @@ Phase 3 (done): hardening.
 
 ## Later
 - Optional OS keychain providers (macOS Keychain, libsecret, Windows DPAPI), opt-in, never required.
-- Sync to the other machines (cachyos-fps, Windows VM) over Tailscale/SSH; the `.enc` files are
-  safe to copy, the key travels separately.
+- Sync between your own machines (e.g. over SSH); the `.enc` files are safe to copy, the key travels separately.
 - Local web UI like `skm`'s.
 - Expiry dates and reminders for keys that need rotation.
