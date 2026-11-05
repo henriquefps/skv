@@ -1,0 +1,10 @@
+{
+  "name": "skv",
+  "version": "0.1.0",
+  "description": "Secrets keeper vault: local, encrypted, cross-platform secrets manager with a CLI and an audit log",
+  "type": "module",
+  "bin": { "skv": "bin/skv.mjs" },
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "license": "MIT"
+}
