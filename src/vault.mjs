@@ -39,6 +39,15 @@ function historyEntry(s, now) {
   return old;
 }
 
+/** Record that `key` was deleted at `at` (only the time: the value is dropped). */
+export function addTombstone(data, key, at) {
+  data.tombstones ??= {};
+  data.tombstones[key] = { deletedAt: at };
+}
+
+/** A group removed with `rm --all` (no secrets, `deletedAt` set) is hidden from listings; its tombstones live on. */
+export const isHiddenGroup = (data) => Boolean(data.deletedAt) && !Object.keys(data.secrets ?? {}).length;
+
 /** An open vault: a home folder plus its master key. */
 export class Vault {
   constructor(home, key) {
@@ -71,8 +80,19 @@ export class Vault {
       .sort();
   }
 
-  hasGroup(group) {
+  /** Group names that are not "deleted" (a group whose secrets were all removed keeps only tombstones and is hidden). */
+  visibleGroupNames() {
+    return this.listGroupNames().filter((g) => !isHiddenGroup(this.readGroup(g)));
+  }
+
+  /** True when the encrypted file exists, even for a deleted (hidden) group. */
+  hasGroupFile(group) {
     return fs.existsSync(this.groupFile(group));
+  }
+
+  hasGroup(group) {
+    if (!fs.existsSync(this.groupFile(group))) return false;
+    return !isHiddenGroup(this.readGroup(group));
   }
 
   /** Decrypted group, or null when it does not exist. */
@@ -99,7 +119,7 @@ export class Vault {
 
   requireGroup(group) {
     const data = this.readGroup(group);
-    if (!data) throw new SkvError('not-found', `no group "${group}" (see \`skv groups\`)`);
+    if (!data || isHiddenGroup(data)) throw new SkvError('not-found', `no group "${group}" (see \`skv groups\`)`);
     return data;
   }
 
@@ -109,8 +129,23 @@ export class Vault {
     writeFileAtomic(this.groupFile(data.group), `${JSON.stringify(envelope)}\n`);
   }
 
+  /**
+   * `rm <group> --all`: every secret becomes a tombstone (so the deletion propagates with `skv sync`) and the
+   * group disappears from listings. Returns the number of removed secrets.
+   */
   deleteGroup(group) {
-    this.locked(group, () => fs.rmSync(this.groupFile(group), { force: true }));
+    return this.locked(group, () => {
+      const data = this.readGroup(group);
+      if (!data) return 0;
+      const now = new Date().toISOString();
+      const keys = Object.keys(data.secrets);
+      for (const key of keys) addTombstone(data, key, now);
+      data.secrets = {};
+      data.description = '';
+      data.deletedAt = now;
+      this.writeGroup(data);
+      return keys.length;
+    });
   }
 
   emptyGroup(group) {
@@ -131,19 +166,29 @@ export class Vault {
 
   #setSecrets(group, entries, { description } = {}) {
     const data = this.readGroup(group) ?? this.emptyGroup(group);
-    if (description !== undefined) data.description = description;
+    delete data.deletedAt;
+    if (description !== undefined && description !== data.description) {
+      data.description = description;
+      data.descriptionUpdatedAt = new Date().toISOString();
+    }
     const now = new Date().toISOString();
     const results = entries.map(({ key, value, type = 'string', filename, note }) => {
       assertKey(key);
       if (typeof value !== 'string') throw new TypeError('secret value must be a string');
       const prev = data.secrets[key];
+      // A set after a delete must win over the tombstone, even within the same millisecond.
+      const stamp = data.tombstones?.[key] && data.tombstones[key].deletedAt >= now ? new Date(Date.parse(data.tombstones[key].deletedAt) + 1).toISOString() : now;
+      if (data.tombstones?.[key]) {
+        delete data.tombstones[key];
+        if (!Object.keys(data.tombstones).length) delete data.tombstones;
+      }
       const changed = !prev || prev.value !== value || prev.type !== type || (prev.filename ?? null) !== (filename ?? null);
       const status = !prev ? 'added' : changed ? 'changed' : 'unchanged';
       if (!prev) {
-        data.secrets[key] = { type, value, createdAt: now, updatedAt: now, history: [] };
+        data.secrets[key] = { type, value, createdAt: stamp, updatedAt: stamp, history: [] };
       } else if (changed) {
-        prev.history = [historyEntry(prev, now), ...(prev.history ?? [])].slice(0, HISTORY_LIMIT);
-        Object.assign(prev, { type, value, updatedAt: now });
+        prev.history = [historyEntry(prev, stamp), ...(prev.history ?? [])].slice(0, HISTORY_LIMIT);
+        Object.assign(prev, { type, value, updatedAt: stamp });
       }
       const s = data.secrets[key];
       if (type === 'file') s.filename = filename;
@@ -167,6 +212,7 @@ export class Vault {
       const data = this.requireGroup(group);
       if (!data.secrets[key]) throw new SkvError('not-found', `no key ${key} in group "${group}"`);
       delete data.secrets[key];
+      addTombstone(data, key, new Date().toISOString());
       this.writeGroup(data);
     });
   }
@@ -204,7 +250,7 @@ export class Vault {
 
   /** Summary of every group: name, description, count, last change. Never values. */
   groups() {
-    return this.listGroupNames().map((name) => {
+    return this.visibleGroupNames().map((name) => {
       const data = this.readGroup(name);
       const secrets = Object.values(data.secrets);
       const updatedAt = secrets.map((s) => s.updatedAt).sort().at(-1) ?? fs.statSync(this.groupFile(name)).mtime.toISOString();
@@ -214,7 +260,7 @@ export class Vault {
 
   /** Key listing for one group or all: group, key, type, filename, note, createdAt, updatedAt, versions. Never values. */
   list(group) {
-    const names = group ? [assertGroup(group)] : this.listGroupNames();
+    const names = group ? [assertGroup(group)] : this.visibleGroupNames();
     if (group) this.requireGroup(group);
     return names.flatMap((name) => {
       const data = this.readGroup(name);

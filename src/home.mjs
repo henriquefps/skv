@@ -152,7 +152,14 @@ export async function doctor(home, env = process.env) {
         bad++;
         add('warn', 'links', `${l.path} no longer exists (linked to ${l.groups.join(',')}; remove with \`skv link --rm --path "${l.path}"\`)`);
       }
-      const missing = l.groups.filter((g) => !fs.existsSync(path.join(p.vault, `${g}.enc`)));
+      const missing = l.groups.filter((g) => {
+        if (!fs.existsSync(path.join(p.vault, `${g}.enc`))) return true;
+        try {
+          return key ? !new Vault(home, key).hasGroup(g) : false;
+        } catch {
+          return false;
+        }
+      });
       if (missing.length) {
         bad++;
         add('warn', 'links', `${l.path} is linked to missing group(s) ${missing.join(',')} (re-link with \`skv link\`)`);
@@ -181,8 +188,10 @@ export async function doctor(home, env = process.env) {
       checkMode(file, 0o600, 'group');
       if (!vault) continue;
       try {
-        const n = Object.keys(vault.readGroup(f.slice(0, -4)).secrets).length;
-        add('ok', 'decrypt', `${f}: ${n} secret(s)`);
+        const data = vault.readGroup(f.slice(0, -4));
+        const n = Object.keys(data.secrets).length;
+        const t = Object.keys(data.tombstones ?? {}).length;
+        add('ok', 'decrypt', `${f}: ${n} secret(s)${t ? `, ${t} tombstone(s)` : ''}`);
       } catch (err) {
         add('error', 'decrypt', `${f}: ${err.message}`);
       }

@@ -22,7 +22,7 @@ them without copying `.env` files into repos.
 - Protecting secrets from an agent that runs as the user: the vault prevents leaks (repo commits, backups,
   stray `.env` files, accidental reads into transcripts), it is not a sandbox. The agent read policy (Phase 3)
   is a guard against accidents, not a security boundary.
-- Sync between machines, sharing with other people, a web UI. See "Later".
+- Sharing with other people, a web UI. See "Later". (Sync between your own machines shipped in Phase 4.)
 
 ## Storage layout
 
@@ -174,8 +174,34 @@ Phase 3 (done): hardening.
   work while locked. New log actions: `config`, `passphrase-set`, `passphrase-change`, `passphrase-remove`,
   `unlock`, `lock` (never passphrases or keys).
 
+Phase 4 (done): sync between machines over SSH, deletion tombstones.
+
+- `skv push|pull|sync <host> [groups] [--dry-run] [--json] [--remote-skv cmd]`. The local skv spawns
+  `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> <remote-skv> _sync <hello|send|receive> [groups]` (argv array, no
+  shell; a host starting with `-` is rejected; `SKV_SSH` overrides the ssh executable). The remote command defaults to
+  `skv`, `--remote-skv` overrides it per call and `skv config set remote-skv <host> "<cmd>"` persistently
+  (`settings.remoteSkv` in `config.json`). The remote command line is a plain `<cmd> _sync <op>` so a cmd.exe SSH shell works.
+- Protocol 1: newline-delimited JSON. `send` writes `{type:hello,protocol,version}`, then `{type:group,data}` per group
+  (decrypted group objects, tombstones included) and `{type:end}`. `receive` writes the hello, reads
+  `{type:push,protocol,version,dryRun,from}`, the groups and `end` on stdin, merges and answers
+  `{type:report,groups}`. Errors are `{type:error,code,message}` plus exit 1. An unknown `_sync` or another protocol is
+  "update skv on <host>"; a locked vault is "run `skv unlock` on <host>". An incomplete transfer (no `end`) applies nothing.
+- Each machine keeps its own master key; the sender decrypts and the receiver re-encrypts. Values only travel through the pipe.
+  `_sync send` is refused for agents (it prints values); `push`/`pull`/`sync` are allowed for them. Over SSH the remote has
+  no agent markers, so it runs as the user (intended; the agent policy is a guard against accidents, not a boundary).
+- Merge (pure function `mergeGroup` in `src/sync.mjs`, applied under the group lock on each side), per (group, key): one
+  side only -> copied; same value and type -> untouched; different -> newer `updatedAt` wins, the loser goes into the
+  winner's history (deduplicated, `HISTORY_LIMIT`); tie -> the receiver keeps its value, conflict reported. The description
+  carries `descriptionUpdatedAt` and the newer wins (a non-empty one fills an empty one). `sync` = pull, then push of the
+  merged result, so a dry run reports the push as it would be after the pull. Reports hold key names only.
+- Audit: `push|pull|sync` locally, `sync-send` / `sync-receive` on the remote, with peer, groups, `group/KEY` names and counts.
+- **Tombstones.** Group files gain an optional `tombstones: { KEY: { deletedAt } }`; `skv rm` drops the value and keeps only
+  the time. `rm <group> --all` tombstones every key and sets `deletedAt` on the group, which then disappears from `groups`,
+  `ls`, `link` (a later `set` brings it back). Tombstone vs value: newer of `deletedAt` / `updatedAt` wins, a tie goes to
+  the deletion; `set` removes the tombstone and stamps `updatedAt` after it. Format version unchanged: old `.enc` files read
+  fine and old skv versions ignore the extra fields. Tombstones are never pruned (a few bytes each); `doctor` reports counts.
+
 ## Later
 - Optional OS keychain providers (macOS Keychain, libsecret, Windows DPAPI), opt-in, never required.
-- Sync between your own machines (e.g. over SSH); the `.enc` files are safe to copy, the key travels separately.
 - Local web UI like `skm`'s.
 - Expiry dates and reminders for keys that need rotation.

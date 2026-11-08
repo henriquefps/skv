@@ -46,3 +46,26 @@ export function agentReadPolicy(home) {
 
 export const agentReadDenied = (what, hint = 'use `skv run <group> -- <cmd>` instead') =>
   new SkvError('denied', `${what} is disabled for agents so values stay out of the transcript: ${hint} (the user can change this with \`skv config set agent-read allow\`)`);
+
+/**
+ * remote-skv (per host): the command that starts skv on a remote machine for push/pull/sync, for hosts where
+ * `skv` is not on the non-interactive PATH (e.g. `node ~/Projetos/skv/bin/skv.mjs`). Stored in
+ * config.json `settings.remoteSkv` as { host: command }.
+ */
+export function readRemoteSkv(home) {
+  const m = readConfig(home).settings?.remoteSkv;
+  return m && typeof m === 'object' ? { ...m } : {};
+}
+
+/** Set (or, with an empty command, clear) the remote skv command of a host. Returns the previous one or null. */
+export function writeRemoteSkv(home, host, command) {
+  return updateConfig(home, (cfg) => {
+    cfg.settings ??= {};
+    const map = (cfg.settings.remoteSkv ??= {});
+    const previous = map[host] ?? null;
+    if (command) map[host] = command;
+    else delete map[host];
+    if (!Object.keys(map).length) delete cfg.settings.remoteSkv;
+    return previous;
+  });
+}

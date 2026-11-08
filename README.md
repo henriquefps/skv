@@ -76,7 +76,7 @@ skv lock
 | `skv set <group> <KEY> [--note t] [--desc t]` | Store a value read from stdin (one trailing newline is stripped) or a hidden TTY prompt. A value on the command line is refused. `--desc` sets the group description. Prints added/changed/unchanged and a fingerprint. |
 | `skv set-file <group> <KEY> <path> [--note t]` | Store a file's bytes (base64 inside the vault) with its file name. |
 | `skv get <group> <KEY>` | Print one value (no trailing newline when piped; raw bytes for file secrets). Logged. Refused for agents unless `agent-read` is `allow` (see below). |
-| `skv rm <group> <KEY>` / `skv rm <group> --all` | Delete one key or a whole group. Asks for confirmation; `--yes`/`-y` skips it (required without a TTY). |
+| `skv rm <group> <KEY>` / `skv rm <group> --all` | Delete one key or a whole group (a tombstone with only the deletion time is kept, so `skv sync` can propagate it; the value is dropped). Asks for confirmation; `--yes`/`-y` skips it (required without a TTY). |
 | `skv import <group> <file>` | Import a dotenv file: `# comments`, `export KEY=`, unquoted values with ` # inline comments`, `'single'` (literal), `"double"` (escapes `\n \r \t \\ \" \$`) and multiline quoted values. Reports added / changed / unchanged. `--json` for structured output. |
 | `skv rollback <group> <KEY> [--yes]` | Restore the most recent previous value. The current value goes into the history, so a second rollback undoes the first. Asks for confirmation (`--yes`/`-y` without a TTY); an error when the key has no history. Logged with the old and new fingerprints. |
 | `skv export [group[,group...]] [--format dotenv\|json] [-o file]` | Write the secrets to stdout or to a file (mode 0600, atomic). Inside a git repo the path must be git-ignored (checked with `git check-ignore`), otherwise skv refuses. File secrets are skipped (use `run` or `get`). Agents may only use `-o` unless `agent-read` is `allow`. |
@@ -89,6 +89,10 @@ skv lock
 | `skv doctor [--json]` | Checks folder/file permissions, key present and valid, config, every group decrypts, leftover temp and stale lock files, links whose folder or groups are gone (warnings), passphrase on/off, the unlock session and stale session files. While locked, the decrypt checks are skipped with a warning. Exit 1 on errors. |
 | `skv config [--json]` | Show the settings (`agent-read`). |
 | `skv config set agent-read allow\|deny` | Let agents print values (`allow`) or not (`deny`, the default). An agent can't set `allow` (exit 1, logged as a denied config change); only the user can, from their own terminal. Agents may tighten it to `deny`. |
+| `skv push <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]` | Send local secrets to `<host>` over SSH and merge them there. No groups: all. See "Sync between your machines". |
+| `skv pull <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]` | Fetch `<host>`'s secrets over SSH and merge them here. |
+| `skv sync <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]` | Pull, then push: both machines end up equal. |
+| `skv config set remote-skv <host> "<cmd>"` | How to start skv on `<host>` (default `skv`). `skv config unset remote-skv <host>` clears it; `skv config` lists them. |
 | `skv passphrase set` | Protect the key file with a passphrase (hidden prompt twice, or one line on stdin; at least 8 characters). The master key and the vault don't change. |
 | `skv passphrase change` | Current passphrase, then the new one (stdin: two lines). A running session keeps working. |
 | `skv passphrase remove` | After the current passphrase, write the raw key back to the key file and end any session. |
@@ -111,7 +115,52 @@ Environment:
 - `SKV_KEY`: base64 master key; takes precedence over the unlock session and `$SKV_HOME/key` (handy on CI or to keep
   the key off disk; also opens a passphrase-protected vault).
 - `SKV_ACTOR=user|agent`: override the actor detection (log and agent read policy).
+- `SKV_SSH`: the ssh executable used by `push`/`pull`/`sync` (default `ssh`). A path ending in `.js`/`.mjs` is run with
+  node (used by the tests to simulate a second machine).
 - `NO_COLOR`: disable colors.
+
+## Sync between your machines
+
+No server and no daemon. `skv push|pull|sync <host>` runs `ssh <host> <remote-skv> _sync <op>` and speaks
+newline-delimited JSON with the skv on the other machine over the SSH pipe. Each machine keeps its **own** master key:
+the sender decrypts, the receiver re-encrypts with its key. Keys never travel, and values only pass through the pipe
+(never argv, env, logs or disk). ssh runs with `-o BatchMode=yes -o ConnectTimeout=10` and an argv array (no shell), so
+it needs key-based login; `<host>` is anything ssh accepts (`my-server`, `user@100.x.y.z`) but cannot start with `-`.
+
+```
+skv sync my-server                      # both end up equal (pull, then push), all groups
+skv push my-server openai,cloudflare   # only these groups, local -> remote
+skv pull user@100.x.y.z --dry-run       # show what would change, write nothing
+skv sync my-server --json              # structured report
+
+# skv is not on the non-interactive PATH of the remote:
+skv sync my-server --remote-skv "node ~/Projetos/skv/bin/skv.mjs"
+skv config set remote-skv my-server "node ~/Projetos/skv/bin/skv.mjs"   # remember it
+
+# a Windows host with cmd.exe as the SSH shell: the remote command is a plain `<cmd> _sync <op>` line
+skv config set remote-skv win-pc "node C:\\Users\\me\\skv\\bin\\skv.mjs"
+skv sync win-pc
+```
+
+Merge rules, per (group, key):
+
+- Only on one side: copied, with type, file name, note and history.
+- Same value: nothing changes (`updatedAt` is not bumped).
+- Different value: the newer `updatedAt` wins and the losing value goes into the winner's history (last 5), so
+  `skv rollback` can undo it. Equal `updatedAt` with different values: each side keeps its value and reports a conflict.
+- The group description and a key's note travel with the winner. File secrets (`set-file`) travel too.
+- **Deletions propagate.** `skv rm` leaves a tombstone (`{ deletedAt }`, the value is dropped). Against a value, the
+  newer of `deletedAt` / `updatedAt` wins (a tie goes to the deletion); a later `skv set` replaces the tombstone.
+  Tombstones are invisible to `ls`, `groups`, `get`, `run`, `export` and `which`. Old vault files keep working.
+
+Each side reports `added / updated / deleted / unchanged / conflicts` with key names only, never values (`--json` for
+the structured form; `--dry-run` writes nothing on either side). Every side writes an audit entry (`push`, `pull`,
+`sync` locally; `sync-receive` / `sync-send` on the machine that was called) and takes the per-group lock around each
+merge. If a vault is passphrase-protected with no session, the command fails with "run `skv unlock` on <host>".
+
+Agents may run `push`, `pull` and `sync`. The hidden `skv _sync send` prints values to stdout, so it is refused for agents
+(agent-read policy); the remote process started over SSH has no agent markers and runs as you. Like the rest of the
+agent policy this is a guard against accidental transcript leaks, not a security boundary.
 
 ## Storage
 

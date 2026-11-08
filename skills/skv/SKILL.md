@@ -53,8 +53,12 @@ look for the key some other way. `skv status` tells you whether the vault is loc
 6. **Linking a project** (`skv link <group>[,group...] --path <dir>`) changes the user's config: do it when the
    user asks or agrees. `skv rollback <group> <KEY>` restores the previous value after a bad rotation; it needs the
    user's confirmation (do not pass `--yes` unless they agreed).
-7. **Never** commit values, write them to logs, or paste them into PRs, issues, docs or chat.
-8. **Passphrase and sessions are the user's.** Don't run `skv passphrase ...`, `skv unlock` or `skv lock` unless the
+7. **Syncing machines:** `skv sync <host>` (or `skv push|pull <host>`; `--dry-run` first if unsure) merges the vault with
+   another of the user's machines over SSH; values never reach the transcript. Add `--remote-skv "<cmd>"` when skv is not
+   on the remote PATH. If it says the vault is locked, ask the user to run `skv unlock` on that machine. Never run
+   `skv _sync ...` yourself: it is the internal protocol and prints values (refused for agents).
+8. **Never** commit values, write them to logs, or paste them into PRs, issues, docs or chat.
+9. **Passphrase and sessions are the user's.** Don't run `skv passphrase ...`, `skv unlock` or `skv lock` unless the
    user asks you to.
 
 ## Commands
@@ -73,6 +77,7 @@ look for the key some other way. `skv status` tells you whether the vault is loc
 | `skv link <group>[,group...] [--path dir]` / `skv link --rm [--path dir]` / `skv links` | link groups to a project folder, unlink, list |
 | `skv rollback <group> <KEY>` | restore the previous value (again to undo); asks for confirmation |
 | `skv rm <group> <KEY>` / `skv rm <group> --all` | delete; asks for confirmation (do not pass `--yes` unless the user agreed) |
+| `skv sync <host> [group[,group...]] [--dry-run] [--json]` / `skv push` / `skv pull` | merge the vault with another machine over SSH (newer wins, deletions propagate; reports key names only) |
 | `skv log [group] [--since 7d] [--json]` | audit log: who read, injected or changed what (never values) |
 | `skv doctor` | permissions, key present, every group decrypts, orphan links, passphrase and session |
 | `skv status [--json]` | locked / unlocked / no passphrase, expiry, key source |

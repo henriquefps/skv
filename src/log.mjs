@@ -4,7 +4,7 @@ import { SkvError, usage } from './errors.mjs';
 import { ensurePrivateDir, FILE_MODE } from './fsutil.mjs';
 import { isWindows, layout } from './paths.mjs';
 
-export const ACTIONS = ['init', 'set', 'set-file', 'rm', 'import', 'export', 'get', 'run', 'rollback', 'link', 'config', 'passphrase-set', 'passphrase-change', 'passphrase-remove', 'unlock', 'lock'];
+export const ACTIONS = ['init', 'set', 'set-file', 'rm', 'import', 'export', 'get', 'run', 'rollback', 'link', 'config', 'passphrase-set', 'passphrase-change', 'passphrase-remove', 'unlock', 'lock', 'push', 'pull', 'sync', 'sync-send', 'sync-receive'];
 
 /**
  * `agent` when the process runs under a coding agent (CLAUDECODE set by Claude Code, CODEX_* set by Codex),
