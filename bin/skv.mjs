@@ -11,7 +11,8 @@ import { doctor, initHome, keyStatus, openVault } from '../src/home.mjs';
 import { readKeyFile, writeKeyFile } from '../src/keys.mjs';
 import { assertPassphrase, unwrapKey, wrapKey } from '../src/passphrase.mjs';
 import { DEFAULT_UNLOCK, parseDuration, startSession, stopSession } from '../src/session.mjs';
-import { agentReadDenied, agentReadPolicy, readSettings, SETTINGS, settingFor, writeSetting } from '../src/settings.mjs';
+import { agentReadDenied, agentReadPolicy, readRemoteSkv, readSettings, SETTINGS, settingFor, writeRemoteSkv, writeSetting } from '../src/settings.mjs';
+import { applyIncoming, assertHost, changedKeys, fetchGroups, parseGroupArg, sendGroups, serveReceive, serveSend, hello as syncHello, totals, encodeLine } from '../src/sync.mjs';
 import { linkedGroups, listLinks, normalizeDir, removeLink, setLink } from '../src/links.mjs';
 import { appendLog, detectActor, parseSince, readLog } from '../src/log.mjs';
 import { skvHome } from '../src/paths.mjs';
@@ -43,6 +44,15 @@ const USAGE = `skv: secrets keeper vault (local, encrypted)
   skv doctor [--json]                        permissions, key, files decrypt, orphan links, passphrase, session
   skv config [--json] | skv config set agent-read allow|deny
                                              settings (agent-read: may agents print values; default deny)
+  skv config set remote-skv <host> "<cmd>"   how to start skv on <host> for push/pull/sync (default: skv);
+                                             skv config unset remote-skv <host>
+  skv push <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]
+                                             send local secrets to <host> over ssh and merge them there
+  skv pull <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]
+                                             fetch <host>'s secrets over ssh and merge them here
+  skv sync <host> [group[,group...]] [--dry-run] [--json] [--remote-skv cmd]
+                                             pull, then push: both machines end up equal
+                                             (newer change wins; deletions propagate; no groups = all)
   skv passphrase set|change|remove           protect the key file with a passphrase (opt-in; stdin for scripts)
   skv unlock [--for 8h]                      start a background session that holds the key (30m, 12h, 1d...)
   skv lock                                   end the session
@@ -50,9 +60,9 @@ const USAGE = `skv: secrets keeper vault (local, encrypted)
 
 Exit codes: 0 ok, 1 error, 2 usage (run forwards the command's exit code; 127 if it can't be started).
 Env: SKV_HOME (vault folder), SKV_KEY (base64 master key, overrides the session and $SKV_HOME/key),
-     SKV_ACTOR=user|agent (override agent detection).`;
+     SKV_ACTOR=user|agent (override agent detection), SKV_SSH (ssh executable for push/pull/sync, default ssh).`;
 
-const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since', 'path', 'for']);
+const FLAGS_WITH_VALUE = new Set(['note', 'desc', 'format', 'output', 'since', 'path', 'for', 'remote-skv']);
 const SHORT = { o: 'output', y: 'yes', h: 'help' };
 
 export function parseArgs(argv) {
@@ -382,6 +392,21 @@ async function main(argv) {
 
     case 'config': {
       if (!fs.existsSync(home)) throw new SkvError('no-home', `${home} does not exist: run \`skv init\``);
+      if (pos[1] === 'set' && pos[2] === 'remote-skv') {
+        need(pos, 5, 'skv config set remote-skv <host> "<command>"');
+        const host = assertHost(pos[3]);
+        const previous = writeRemoteSkv(home, host, pos[4]);
+        log({ action: 'config', setting: 'remote-skv', host, setTo: pos[4], previous });
+        return console.log(`remote-skv ${host}: ${previous ?? 'skv'} -> ${pos[4]}`);
+      }
+      if (pos[1] === 'unset') {
+        need(pos, 4, 'skv config unset remote-skv <host>');
+        if (pos[2] !== 'remote-skv') throw usage('usage: skv config unset remote-skv <host>');
+        const host = assertHost(pos[3]);
+        const previous = writeRemoteSkv(home, host, '');
+        log({ action: 'config', setting: 'remote-skv', host, previous });
+        return console.log(previous ? `remote-skv ${host}: ${previous} -> skv (default)` : `remote-skv ${host}: was not set`);
+      }
       if (pos[1] === 'set') {
         need(pos, 4, 'skv config set <setting> <value>   (agent-read allow|deny)');
         const [name, value] = [pos[2], pos[3]];
@@ -396,9 +421,20 @@ async function main(argv) {
       }
       if (pos[1]) throw usage('usage: skv config [--json] | skv config set <setting> <value>');
       const settings = readSettings(home);
-      if (flags.json) return json(settings);
-      return console.log(table(['SETTING', 'VALUE', 'MEANING'], Object.entries(settings).map(([k, v]) => [k, v, SETTINGS[k].describe])));
+      const remotes = readRemoteSkv(home);
+      if (flags.json) return json(Object.keys(remotes).length ? { ...settings, 'remote-skv': remotes } : settings);
+      const rows = Object.entries(settings).map(([k, v]) => [k, v, SETTINGS[k].describe]);
+      for (const [host, cmd] of Object.entries(remotes)) rows.push([`remote-skv ${host}`, cmd, 'command that starts skv on that host (push/pull/sync)']);
+      return console.log(table(['SETTING', 'VALUE', 'MEANING'], rows));
     }
+
+    case 'push':
+    case 'pull':
+    case 'sync':
+      return syncCommand(cmd, pos, flags, home, log);
+
+    case '_sync':
+      return syncServe(pos, home, log);
 
     case 'passphrase': {
       const sub = pos[1];
@@ -474,6 +510,114 @@ async function main(argv) {
 
     default:
       throw usage(`unknown command: ${cmd}\n\n${USAGE}`);
+  }
+}
+
+// ---- sync ----------------------------------------------------------------
+
+const SYNC_USAGE = (cmd) => `usage: skv ${cmd} <host> [group[,group...]] [--dry-run] [--json] [--remote-skv "<command>"]`;
+
+/** Print one side's report: counts, then the key names that changed. Never values. */
+function printReport(label, groups, dryRun) {
+  const t = totals(groups);
+  console.log(`${label}${dryRun ? ' (dry run, nothing written)' : ''}: ${t.added} added, ${t.updated} updated, ${t.deleted} deleted, ${t.unchanged} unchanged, ${t.conflicts} conflict(s)`);
+  for (const g of groups) {
+    for (const f of ['added', 'updated', 'deleted', 'conflicts']) for (const k of g[f]) console.log(`  ${f === 'conflicts' ? c.yellow('conflict') : f.padEnd(8)} ${g.group}/${k}${f === 'conflicts' ? c.dim('  (same time, different values: kept this side\'s value)') : ''}`);
+    if (g.description) console.log(`  description ${g.group}`);
+  }
+}
+
+async function syncCommand(cmd, pos, flags, home, log) {
+  if (pos.length < 2 || pos.length > 3) throw usage(SYNC_USAGE(cmd));
+  const host = assertHost(pos[1]);
+  const groups = parseGroupArg(pos[2]);
+  if (flags['remote-skv'] === true) throw usage('--remote-skv needs a command');
+  const remoteSkv = flags['remote-skv'] ?? readRemoteSkv(home)[host] ?? 'skv';
+  const dryRun = Boolean(flags['dry-run']);
+  const conn = { host, remoteSkv, groups };
+  const vault = await openVault(home);
+  const result = { host, command: cmd, dryRun };
+  const counts = (gs) => totals(gs);
+
+  const doPull = async (requireAll) => {
+    const incoming = await fetchGroups(conn);
+    const picked = groups ? incoming.filter((g) => groups.includes(g.group)) : incoming;
+    if (groups && requireAll) for (const g of groups) if (!picked.some((x) => x.group === g)) throw new SkvError('not-found', `no group "${g}" on ${host}`);
+    const merged = new Map();
+    const reports = picked.map((g) => {
+      const r = applyIncoming(vault, g, { dryRun });
+      merged.set(g.group, r.data);
+      return r.report;
+    });
+    return { reports, merged };
+  };
+  const doPush = async (merged = new Map()) => {
+    const names = groups ?? vault.listGroupNames();
+    for (const g of names) if (!merged.has(g) && !vault.hasGroupFile(g)) throw new SkvError('not-found', `no group "${g}" here${cmd === 'sync' ? ` or on ${host}` : ''} (see \`skv groups\`)`);
+    const data = names.map((g) => merged.get(g) ?? vault.readGroup(g));
+    return sendGroups({ ...conn, groups: data, dryRun, from: os.hostname() });
+  };
+  const logIt = (action, extra) => log({ action, group: (groups ?? []).join(',') || null, groups: groups ?? 'all', peer: host, dryRun, ...extra });
+
+  let pull;
+  let pushReports;
+  if (cmd === 'pull') {
+    pull = (await doPull(true)).reports;
+    logIt('pull', { counts: counts(pull), keys: changedKeys(pull) });
+    result.local = { groups: pull, totals: counts(pull) };
+  } else if (cmd === 'push') {
+    pushReports = await doPush();
+    logIt('push', { counts: counts(pushReports), keys: changedKeys(pushReports) });
+    result.remote = { groups: pushReports, totals: counts(pushReports) };
+  } else {
+    const p = await doPull(false);
+    pull = p.reports;
+    pushReports = await doPush(p.merged);
+    logIt('sync', { counts: { local: counts(pull), remote: counts(pushReports) }, keys: [...changedKeys(pull), ...changedKeys(pushReports)] });
+    result.local = { groups: pull, totals: counts(pull) };
+    result.remote = { groups: pushReports, totals: counts(pushReports) };
+  }
+  if (flags.json) return json(result);
+  if (result.local) printReport(`here (pulled from ${host})`, pull, dryRun);
+  if (result.remote) printReport(`${host}${cmd === 'push' || cmd === 'sync' ? ' (pushed)' : ''}`, pushReports, dryRun);
+}
+
+/** The hidden `_sync hello|send|receive` side that the other machine's skv talks to over ssh. */
+async function syncServe(pos, home, log) {
+  const op = pos[1];
+  const write = (m) => process.stdout.write(encodeLine(m));
+  const fail = (err) => {
+    write({ type: 'error', code: err instanceof SkvError ? err.code : 'internal', message: err instanceof SkvError ? err.message : String(err?.message ?? err) });
+    process.exitCode = 1;
+  };
+  try {
+    if (op === 'hello') return write(syncHello());
+    if (op === 'send') {
+      const groups = parseGroupArg(pos[2]);
+      if (agentDenied(home)) {
+        log({ action: 'sync-send', group: (groups ?? []).join(',') || null, denied: true });
+        throw agentReadDenied('`skv _sync send` (it prints values)', 'use `skv push`/`skv pull`/`skv sync <host>` instead');
+      }
+      write(syncHello());
+      const vault = await openVault(home);
+      const sent = serveSend(vault, groups, write);
+      log({ action: 'sync-send', group: sent.map((s) => s.group).join(',') || null, groups: sent.map((s) => s.group), keys: sent.flatMap((s) => s.keys.map((k) => `${s.group}/${k}`)) });
+      return;
+    }
+    if (op === 'receive') {
+      write(syncHello());
+      const vault = await openVault(home);
+      const text = await new Promise((resolve, reject) => {
+        let t = '';
+        process.stdin.setEncoding('utf8').on('data', (d) => (t += d)).on('end', () => resolve(t)).on('error', reject);
+      });
+      const r = serveReceive(vault, text, write);
+      log({ action: 'sync-receive', group: r.reports.map((g) => g.group).join(',') || null, groups: r.reports.map((g) => g.group), peer: r.peer, dryRun: r.dryRun, counts: totals(r.reports), keys: changedKeys(r.reports) });
+      return;
+    }
+    throw usage('usage: skv _sync hello|send|receive (internal: used by push/pull/sync)');
+  } catch (err) {
+    fail(err);
   }
 }
 
